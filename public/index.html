@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>地理围栏告警系统</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="app-container">
+    <header class="app-header">
+      <h1>🌍 地理围栏告警系统</h1>
+      <div class="header-info">
+        <span class="status-badge" id="wsStatus">连接中...</span>
+      </div>
+    </header>
+
+    <div class="main-content">
+      <div class="map-container">
+        <div class="toolbar">
+          <div class="tool-group">
+            <button class="tool-btn active" data-tool="select" title="选择工具">
+              <span>🖱️</span> 选择
+            </button>
+            <button class="tool-btn" data-tool="draw-fence" title="绘制围栏">
+              <span>✏️</span> 绘制围栏
+            </button>
+            <button class="tool-btn" data-tool="add-poi" title="添加POI">
+              <span>📍</span> 添加POI
+            </button>
+          </div>
+          <div class="tool-group">
+            <button class="tool-btn" id="clearTrajectory" title="清除轨迹">
+              <span>🧹</span> 清除轨迹
+            </button>
+            <button class="tool-btn" id="resetView" title="重置视图">
+              <span>🔄</span> 重置视图
+            </button>
+          </div>
+        </div>
+
+        <canvas id="mapCanvas"></canvas>
+
+        <div class="map-controls">
+          <button class="zoom-btn" id="zoomIn">+</button>
+          <button class="zoom-btn" id="zoomOut">−</button>
+        </div>
+
+        <div class="fence-dialog" id="fenceDialog" style="display: none;">
+          <div class="dialog-content">
+            <h3>创建围栏</h3>
+            <div class="form-group">
+              <label>围栏名称</label>
+              <input type="text" id="fenceName" placeholder="请输入围栏名称">
+            </div>
+            <div class="form-group">
+              <label>围栏类型</label>
+              <select id="fenceType">
+                <option value="normal">普通区（进出记录，warning）</option>
+                <option value="forbidden_enter">禁入区（进入告警，critical）</option>
+                <option value="forbidden_leave">禁出区（离开告警，critical）</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label>围栏颜色</label>
+              <input type="color" id="fenceColor" value="#3498db">
+            </div>
+            <div class="dialog-actions">
+              <button class="btn btn-secondary" id="cancelFence">取消</button>
+              <button class="btn btn-primary" id="saveFence">保存</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="edit-dialog" id="editDialog" style="display: none;">
+          <div class="dialog-content">
+            <h3>编辑围栏</h3>
+            <div class="form-group">
+              <label>围栏名称</label>
+              <input type="text" id="editFenceName">
+            </div>
+            <div class="form-group">
+              <label>围栏类型</label>
+              <select id="editFenceType">
+                <option value="normal">普通区</option>
+                <option value="forbidden_enter">禁入区</option>
+                <option value="forbidden_leave">禁出区</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label>围栏颜色</label>
+              <input type="color" id="editFenceColor">
+            </div>
+            <div class="dialog-actions">
+              <button class="btn btn-danger" id="deleteFence">删除</button>
+              <button class="btn btn-secondary" id="cancelEdit">取消</button>
+              <button class="btn btn-primary" id="saveEdit">保存</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <aside class="side-panel">
+        <div class="panel-section">
+          <h3>📋 围栏列表</h3>
+          <div class="fence-list" id="fenceList"></div>
+        </div>
+
+        <div class="panel-section alerts-section">
+          <h3>🔔 实时告警 <span class="alert-count" id="alertCount">0</span></h3>
+          <div class="alert-filters">
+            <select id="filterLevel">
+              <option value="">全部等级</option>
+              <option value="critical">仅 Critical</option>
+              <option value="warning">仅 Warning</option>
+            </select>
+            <select id="filterTarget">
+              <option value="">全部目标</option>
+            </select>
+          </div>
+          <div class="alert-list" id="alertList"></div>
+        </div>
+      </aside>
+    </div>
+
+    <footer class="status-bar">
+      <div class="status-item">
+        <span class="label">在线目标:</span>
+        <span class="value" id="onlineTargets">5</span>
+      </div>
+      <div class="status-item">
+        <span class="label">今日告警:</span>
+        <span class="value" id="totalAlerts">0</span>
+      </div>
+      <div class="status-item">
+        <span class="label">坐标:</span>
+        <span class="value" id="coordDisplay">--, --</span>
+      </div>
+      <div class="status-item">
+        <span class="label">缩放:</span>
+        <span class="value" id="zoomDisplay">100%</span>
+      </div>
+    </footer>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

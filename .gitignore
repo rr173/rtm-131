@@ -1,8 +1,8 @@
-# 依赖目录
-node_modules/
-
-# 系统文件
+node_modules
+data/*.db
 .DS_Store
+npm-debug.log
+
 
 # 训练记录
 训练记录.md
