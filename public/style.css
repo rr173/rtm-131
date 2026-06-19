@@ -318,6 +318,42 @@ body {
   border-left: 3px solid #f39c12;
 }
 
+.alert-item.info {
+  background: linear-gradient(135deg, rgba(52, 152, 219, 0.3) 0%, rgba(52, 152, 219, 0.1) 100%);
+  border-left: 3px solid #3498db;
+}
+
+.alert-item.none {
+  background: rgba(100, 100, 100, 0.1);
+  border-left: 3px solid #7f8c8d;
+}
+
+.alert-extra {
+  margin-top: 6px;
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.alert-tag {
+  display: inline-block;
+  padding: 2px 6px;
+  background: rgba(79, 172, 254, 0.2);
+  border-radius: 4px;
+  font-size: 10px;
+  color: #4facfe;
+}
+
+.alert-custom {
+  margin-top: 6px;
+  padding: 6px 8px;
+  background: rgba(0, 0, 0, 0.2);
+  border-radius: 4px;
+  font-size: 11px;
+  color: #a0a0b0;
+  font-style: italic;
+}
+
 .alert-header {
   display: flex;
   justify-content: space-between;
@@ -335,6 +371,8 @@ body {
 
 .alert-level.critical { background: #e74c3c; }
 .alert-level.warning { background: #f39c12; }
+.alert-level.info { background: #3498db; }
+.alert-level.none { background: #7f8c8d; }
 
 .alert-time {
   font-size: 10px;

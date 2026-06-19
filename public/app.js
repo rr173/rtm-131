@@ -27,7 +27,9 @@ const state = {
   ws: null,
   filterLevel: '',
   filterTarget: '',
-  editingFenceId: null
+  editingFenceId: null,
+  fenceActiveStatus: new Map(),
+  groups: []
 };
 
 const canvas = document.getElementById('mapCanvas');
@@ -121,26 +123,43 @@ function drawFences() {
     const flashColor = isFlashing ? state.flashingFences.get(fence.id) : null;
     const vertices = fence.vertices;
     const baseColor = fence.color;
+    const isActive = state.fenceActiveStatus.get(fence.id) !== false;
     ctx.beginPath();
     ctx.moveTo(lngToX(vertices[0].lng), latToY(vertices[0].lat));
     for (let i = 1; i < vertices.length; i++) {
       ctx.lineTo(lngToX(vertices[i].lng), latToY(vertices[i].lat));
     }
     ctx.closePath();
-    const r = parseInt(baseColor.slice(1, 3), 16);
-    const g = parseInt(baseColor.slice(3, 5), 16);
-    const b = parseInt(baseColor.slice(5, 7), 16);
-    ctx.fillStyle = `rgba(${r}, ${g}, ${b}, 0.2)`;
+    let fillColor, strokeColor, textColor;
+    if (!isActive) {
+      fillColor = 'rgba(100, 100, 100, 0.1)';
+      strokeColor = flashColor || '#555555';
+      textColor = '#666666';
+    } else {
+      const r = parseInt(baseColor.slice(1, 3), 16);
+      const g = parseInt(baseColor.slice(3, 5), 16);
+      const b = parseInt(baseColor.slice(5, 7), 16);
+      fillColor = `rgba(${r}, ${g}, ${b}, 0.2)`;
+      strokeColor = flashColor || baseColor;
+      textColor = flashColor || baseColor;
+    }
+    ctx.fillStyle = fillColor;
     ctx.fill();
     ctx.lineWidth = isFlashing ? 4 : 2;
-    ctx.strokeStyle = flashColor || baseColor;
+    if (!isActive) {
+      ctx.setLineDash([5, 5]);
+    } else {
+      ctx.setLineDash([]);
+    }
+    ctx.strokeStyle = strokeColor;
     ctx.stroke();
+    ctx.setLineDash([]);
     const centerX = vertices.reduce((sum, v) => sum + v.lng, 0) / vertices.length;
     const centerY = vertices.reduce((sum, v) => sum + v.lat, 0) / vertices.length;
-    ctx.fillStyle = flashColor || baseColor;
+    ctx.fillStyle = textColor;
     ctx.font = 'bold 12px sans-serif';
     ctx.textAlign = 'center';
-    ctx.fillText(fence.name, lngToX(centerX), latToY(centerY));
+    ctx.fillText(fence.name + (isActive ? '' : ' (非活跃)'), lngToX(centerX), latToY(centerY));
     ctx.textAlign = 'left';
   });
 }
@@ -562,6 +581,11 @@ document.getElementById('deleteFence').addEventListener('click', () => {
 async function loadFences() {
   const res = await fetch('/api/fences');
   state.fences = await res.json();
+  state.fences.forEach(f => {
+    if (f.is_active !== undefined) {
+      state.fenceActiveStatus.set(f.id, f.is_active);
+    }
+  });
   updateFenceList();
   render();
 }
@@ -708,6 +732,18 @@ function updateAlertList() {
     const item = document.createElement('div');
     item.className = `alert-item ${alert.level}`;
     const time = new Date(alert.timestamp).toLocaleTimeString();
+    let extraInfo = '';
+    if (alert.group_name) {
+      extraInfo += `<div class="alert-extra"><span class="alert-tag">分组: ${alert.group_name}</span>`;
+    }
+    if (alert.rule_id) {
+      extraInfo += ` <span class="alert-tag">规则#${alert.rule_id}</span>`;
+    }
+    if (extraInfo) extraInfo += '</div>';
+    let customMsg = '';
+    if (alert.custom_message) {
+      customMsg = `<div class="alert-custom">${alert.custom_message}</div>`;
+    }
     item.innerHTML = `
       <div class="alert-header">
         <span class="alert-level ${alert.level}">${alert.level}</span>
@@ -718,6 +754,8 @@ function updateAlertList() {
         <span class="alert-event"> ${eventNames[alert.event_type]} </span>
         <span class="alert-fence">${alert.fence_name}</span>
       </div>
+      ${extraInfo}
+      ${customMsg}
     `;
     listEl.appendChild(item);
   });
@@ -751,6 +789,9 @@ function handlePositionUpdate(data) {
     existing.lng = data.lng;
     existing.lat = data.lat;
     existing.bearing = data.bearing;
+    existing.group_id = data.group_id;
+    existing.group_name = data.group_name;
+    existing.group_color = data.group_color;
     if (data.trajectory) {
       existing.trajectory = data.trajectory;
     }
@@ -822,6 +863,14 @@ function connectWebSocket() {
         loadPOIs();
       } else if (msg.type === 'poi_deleted') {
         loadPOIs();
+      } else if (msg.type === 'fence_status') {
+        state.fenceActiveStatus.set(msg.data.fence_id, msg.data.is_active);
+        console.log(`[FenceStatus] 围栏 ${msg.data.fence_name} 状态变更: ${msg.data.is_active ? '激活' : '停用'}`);
+        render();
+      } else if (msg.data && msg.data.type === 'cycle_warning') {
+        console.warn('[CycleWarning]', msg.data.message);
+      } else if (msg.data && msg.data.type === 'speed_limit') {
+        console.log('[SpeedLimit]', msg.data);
       }
     } catch (e) {
       console.error('消息解析失败:', e);

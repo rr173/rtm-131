@@ -3,7 +3,5 @@ data/*.db
 .DS_Store
 npm-debug.log
 
-
-# 训练记录
 训练记录.md
-*.xlsx
+*.xlxs
