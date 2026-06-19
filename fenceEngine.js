@@ -9,6 +9,7 @@ class FenceEngine {
     this.onAlert = onAlert;
     this.onFenceStatusChange = onFenceStatusChange;
     this.targetStates = new Map();
+    this.targetPositions = new Map();
     this.fenceStats = new Map();
     this.fenceGroupStats = new Map();
     this.enterTimes = new Map();
@@ -24,7 +25,6 @@ class FenceEngine {
   async reloadFences() {
     this.fences = await FenceModel.getAll();
     const allTimeWindows = await FenceTimeWindowModel.getAll();
-    const allAlertRules = await FenceAlertRuleModel.getByFenceId ? [] : [];
     const allActions = await FenceActionModel.getAll();
     const allOverrides = await FenceActivationOverrideModel.getAll();
 
@@ -64,8 +64,8 @@ class FenceEngine {
       const wasActive = this.fenceActiveStatus.get(fence.id);
       const isActive = this.isFenceActive(fence.id);
       this.fenceActiveStatus.set(fence.id, isActive);
-      if (wasActive !== undefined && wasActive !== isActive && this.onFenceStatusChange) {
-        this.onFenceStatusChange({ fence_id: fence.id, fence_name: fence.name, is_active: isActive });
+      if (wasActive !== undefined && wasActive !== isActive) {
+        this.handleFenceActiveStatusChange(fence, wasActive, isActive);
       }
     });
   }
@@ -79,9 +79,69 @@ class FenceEngine {
       const isActive = this.isFenceActive(fence.id);
       if (wasActive !== isActive) {
         this.fenceActiveStatus.set(fence.id, isActive);
-        if (this.onFenceStatusChange) {
-          this.onFenceStatusChange({ fence_id: fence.id, fence_name: fence.name, is_active: isActive });
+        this.handleFenceActiveStatusChange(fence, wasActive, isActive);
+      }
+    });
+  }
+
+  handleFenceActiveStatusChange(fence, wasActive, isActive) {
+    if (this.onFenceStatusChange) {
+      this.onFenceStatusChange({ fence_id: fence.id, fence_name: fence.name, is_active: isActive });
+    }
+    console.log(`[FenceStatus] 围栏 ${fence.name} 状态变更: ${wasActive ? '活跃' : '非活跃'} → ${isActive ? '活跃' : '非活跃'}`);
+
+    if (wasActive && !isActive) {
+      this.clearFenceTargetStates(fence.id);
+    }
+
+    if (!wasActive && isActive) {
+      this.recalculateFenceTargets(fence);
+    }
+  }
+
+  clearFenceTargetStates(fenceId) {
+    this.targetStates.forEach((fenceMap, targetId) => {
+      fenceMap.set(fenceId, false);
+    });
+    const stats = this.fenceStats.get(fenceId);
+    if (stats) {
+      stats.currentTargets.clear();
+    }
+    const groupStats = this.fenceGroupStats.get(fenceId);
+    if (groupStats) {
+      groupStats.forEach(gs => gs.currentTargets.clear());
+    }
+  }
+
+  recalculateFenceTargets(fence) {
+    const stats = this.fenceStats.get(fence.id);
+    const groupStatsMap = this.fenceGroupStats.get(fence.id);
+    if (!stats || !groupStatsMap) return;
+
+    stats.currentTargets.clear();
+    groupStatsMap.forEach(gs => gs.currentTargets.clear());
+
+    this.targetStates.forEach((fenceMap, targetId) => {
+      const pos = this.targetPositions.get(targetId);
+      if (!pos) {
+        fenceMap.set(fence.id, false);
+        return;
+      }
+      const isInside = pointInPolygon({ lng: pos.lng, lat: pos.lat }, fence.vertices);
+      fenceMap.set(fence.id, isInside);
+      if (isInside) {
+        stats.currentTargets.add(targetId);
+        const groupKey = pos.group_id || 'nogroup';
+        if (!groupStatsMap.has(groupKey)) {
+          groupStatsMap.set(groupKey, {
+            currentTargets: new Set(),
+            todayEnterCount: 0,
+            todayLeaveCount: 0,
+            totalStayDuration: 0,
+            stayCount: 0
+          });
         }
+        groupStatsMap.get(groupKey).currentTargets.add(targetId);
       }
     });
   }
@@ -146,22 +206,41 @@ class FenceEngine {
     this.checkFenceStatusChanges();
     const { id: targetId, name: targetName, lng, lat, timestamp } = targetUpdate;
     const point = { lng, lat };
+
     if (!this.targetStates.has(targetId)) {
       this.targetStates.set(targetId, new Map());
     }
     const prevStates = this.targetStates.get(targetId);
+
     const groupBinding = await this.getTargetGroup(targetId);
     const groupId = groupBinding ? groupBinding.group_id : null;
     const groupName = groupBinding ? groupBinding.group_name : null;
+
+    this.targetPositions.set(targetId, {
+      lng,
+      lat,
+      group_id: groupId,
+      group_name: groupName
+    });
+
     this.fences.forEach(fence => {
-      const wasInside = prevStates.get(fence.id) || false;
       const isActive = this.isFenceActive(fence.id);
-      const isInside = isActive && pointInPolygon(point, fence.vertices);
+
+      if (!isActive) {
+        prevStates.set(fence.id, false);
+        return;
+      }
+
+      const wasInside = prevStates.get(fence.id) || false;
+      const isInside = pointInPolygon(point, fence.vertices);
       prevStates.set(fence.id, isInside);
+
       const stats = this.fenceStats.get(fence.id);
-      const groupStats = this.fenceGroupStats.get(fence.id);
-      if (!groupStats.has(groupId || 'nogroup')) {
-        groupStats.set(groupId || 'nogroup', {
+      const groupStatsMap = this.fenceGroupStats.get(fence.id);
+      const groupKey = groupId || 'nogroup';
+
+      if (!groupStatsMap.has(groupKey)) {
+        groupStatsMap.set(groupKey, {
           currentTargets: new Set(),
           todayEnterCount: 0,
           todayLeaveCount: 0,
@@ -169,7 +248,8 @@ class FenceEngine {
           stayCount: 0
         });
       }
-      const gs = groupStats.get(groupId || 'nogroup');
+      const gs = groupStatsMap.get(groupKey);
+
       if (!wasInside && isInside) {
         this.handleEnter(targetId, targetName, fence, lng, lat, timestamp, stats, gs, groupId, groupName);
       } else if (wasInside && !isInside) {
@@ -187,11 +267,13 @@ class FenceEngine {
     }
     const enterKey = `${targetId}_${fence.id}`;
     this.enterTimes.set(enterKey, timestamp);
+
     const rule = this.matchAlertRule(fence.id, groupId);
     let level = 'warning';
     let shouldAlert = true;
     let ruleId = null;
     let customMessage = null;
+
     if (rule) {
       level = rule.enter_level;
       ruleId = rule.id;
@@ -201,7 +283,7 @@ class FenceEngine {
           target_name: targetName,
           fence_name: fence.name,
           time: new Date(timestamp).toLocaleString(),
-          event_type: 'enter'
+          event_type: '进入'
         });
       }
     } else {
@@ -213,6 +295,7 @@ class FenceEngine {
         shouldAlert = false;
       }
     }
+
     if (shouldAlert) {
       const alert = await AlertModel.create({
         target_id: targetId,
@@ -239,6 +322,7 @@ class FenceEngine {
         });
       }
     }
+
     this.executeActions(fence.id, targetId, targetName, 'enter', groupId, timestamp, new Set([fence.id]));
   }
 
@@ -249,6 +333,7 @@ class FenceEngine {
       groupStats.currentTargets.delete(targetId);
       groupStats.todayLeaveCount++;
     }
+
     const enterKey = `${targetId}_${fence.id}`;
     const enterTime = this.enterTimes.get(enterKey);
     if (enterTime) {
@@ -261,11 +346,13 @@ class FenceEngine {
       }
       this.enterTimes.delete(enterKey);
     }
+
     const rule = this.matchAlertRule(fence.id, groupId);
     let level = 'warning';
     let shouldAlert = true;
     let ruleId = null;
     let customMessage = null;
+
     if (rule) {
       level = rule.leave_level;
       ruleId = rule.id;
@@ -275,7 +362,7 @@ class FenceEngine {
           target_name: targetName,
           fence_name: fence.name,
           time: new Date(timestamp).toLocaleString(),
-          event_type: 'leave'
+          event_type: '离开'
         });
       }
     } else {
@@ -287,6 +374,7 @@ class FenceEngine {
         shouldAlert = false;
       }
     }
+
     if (shouldAlert) {
       const alert = await AlertModel.create({
         target_id: targetId,
@@ -313,17 +401,27 @@ class FenceEngine {
         });
       }
     }
+
     this.executeActions(fence.id, targetId, targetName, 'leave', groupId, timestamp, new Set([fence.id]));
+
     await FenceActivationOverrideModel.clearBySourceAndTarget(fence.id, targetId);
+    const fidsToRemove = [];
     this.activationOverrides.forEach((ov, fid) => {
       if (ov.source_fence_id === fence.id && ov.target_id === targetId) {
-        this.activationOverrides.delete(fid);
-        const wasActive = this.fenceActiveStatus.get(fid);
-        const isActive = this.isFenceActive(fid);
-        this.fenceActiveStatus.set(fid, isActive);
-        if (wasActive !== isActive && this.onFenceStatusChange) {
-          this.onFenceStatusChange({ fence_id: fid, is_active: isActive });
-        }
+        fidsToRemove.push(fid);
+      }
+    });
+    fidsToRemove.forEach(fid => {
+      this.activationOverrides.delete(fid);
+      const wasActive = this.fenceActiveStatus.get(fid);
+      const isActiveNow = this.isFenceActive(fid);
+      this.fenceActiveStatus.set(fid, isActiveNow);
+      if (wasActive !== isActiveNow) {
+        this.handleFenceActiveStatusChange(
+          this.fences.find(f => f.id === fid) || { id: fid, name: `Fence ${fid}` },
+          wasActive,
+          isActiveNow
+        );
       }
     });
   }
@@ -336,7 +434,8 @@ class FenceEngine {
     const actions = this.fenceActions.get(fenceId) || [];
     for (const action of actions) {
       if (action.trigger_condition !== 'both' && action.trigger_condition !== eventType) continue;
-      if (action.target_group_id && action.target_group_id !== String(groupId) && action.target_group_id !== 'all') continue;
+      if (action.target_group_id && action.target_group_id !== 'all' && action.target_group_id !== String(groupId)) continue;
+
       switch (action.action_type) {
         case 'webhook':
           this.executeWebhook(action, targetId, targetName, eventType, timestamp);
@@ -409,6 +508,7 @@ class FenceEngine {
     const config = action.action_config;
     const targetFenceId = config.target_fence_id;
     const activate = config.activate !== false;
+
     if (chainSet.has(targetFenceId)) {
       console.warn(`[FenceActivate] 检测到循环触发，源围栏: ${action.fence_id}, 目标围栏: ${targetFenceId}, 已中止`);
       if (this.onAlert) {
@@ -423,8 +523,11 @@ class FenceEngine {
       }
       return;
     }
+
     chainSet.add(targetFenceId);
+
     const expiresAt = config.duration_seconds ? new Date(timestamp + config.duration_seconds * 1000) : null;
+
     await FenceActivationOverrideModel.setOverride(targetFenceId, activate, action.fence_id, targetId, expiresAt);
     this.activationOverrides.set(targetFenceId, {
       fence_id: targetFenceId,
@@ -433,17 +536,21 @@ class FenceEngine {
       target_id: targetId,
       expires_at: expiresAt
     });
+
     const wasActive = this.fenceActiveStatus.get(targetFenceId);
     this.fenceActiveStatus.set(targetFenceId, activate);
-    if (wasActive !== activate && this.onFenceStatusChange) {
+
+    if (wasActive !== activate) {
       const targetFence = this.fences.find(f => f.id === targetFenceId);
-      this.onFenceStatusChange({
-        fence_id: targetFenceId,
-        fence_name: targetFence ? targetFence.name : `Fence ${targetFenceId}`,
-        is_active: activate
-      });
+      this.handleFenceActiveStatusChange(
+        targetFence || { id: targetFenceId, name: `Fence ${targetFenceId}` },
+        wasActive,
+        activate
+      );
     }
+
     console.log(`[FenceActivate] 目标 ${targetName}(${targetId}) ${eventType} 围栏 ${action.fence_id}, ${activate ? '激活' : '停用'} 围栏 ${targetFenceId}`);
+
     if (activate && config.propagate_events !== false) {
       this.executeActions(targetFenceId, targetId, targetName, eventType, groupId, timestamp, chainSet);
     }
