@@ -33,6 +33,9 @@
             <button class="tool-btn" id="clearTrajectory" title="清除轨迹">
               <span>🧹</span> 清除轨迹
             </button>
+            <button class="tool-btn" id="toggleHeatmap" title="热力图">
+              <span>🔥</span> 热力图
+            </button>
             <button class="tool-btn" id="resetView" title="重置视图">
               <span>🔄</span> 重置视图
             </button>
@@ -104,6 +107,52 @@
         <div class="panel-section">
           <h3>📋 围栏列表</h3>
           <div class="fence-list" id="fenceList"></div>
+        </div>
+
+        <div class="panel-section">
+          <h3>🎬 轨迹回放</h3>
+          <div class="replay-controls">
+            <div class="form-group">
+              <label>选择目标</label>
+              <select id="replayTarget">
+                <option value="">请选择目标</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label>时间范围</label>
+              <div class="time-range-group">
+                <select id="replayRange">
+                  <option value="300">最近5分钟</option>
+                  <option value="600">最近10分钟</option>
+                  <option value="1800">最近30分钟</option>
+                  <option value="3600">最近1小时</option>
+                </select>
+              </div>
+            </div>
+            <div class="form-group">
+              <label>回放速度</label>
+              <div class="speed-buttons">
+                <button class="speed-btn active" data-speed="1">1x</button>
+                <button class="speed-btn" data-speed="2">2x</button>
+                <button class="speed-btn" data-speed="5">5x</button>
+                <button class="speed-btn" data-speed="10">10x</button>
+              </div>
+            </div>
+            <div class="replay-progress">
+              <div class="progress-bar">
+                <div class="progress-fill" id="replayProgressFill"></div>
+              </div>
+              <div class="progress-text">
+                <span id="replayCurrentTime">--:--:--</span>
+                <span id="replayProgressText">0%</span>
+              </div>
+            </div>
+            <div class="replay-buttons">
+              <button class="btn btn-primary" id="btnStartReplay">▶ 开始回放</button>
+              <button class="btn btn-secondary" id="btnPauseReplay" disabled>⏸ 暂停</button>
+              <button class="btn btn-secondary" id="btnStopReplay" disabled>⏹ 停止</button>
+            </div>
+          </div>
         </div>
 
         <div class="panel-section alerts-section">

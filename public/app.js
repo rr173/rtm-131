@@ -29,7 +29,18 @@ const state = {
   filterTarget: '',
   editingFenceId: null,
   fenceActiveStatus: new Map(),
-  groups: []
+  groups: [],
+  showHeatmap: false,
+  heatmapData: null,
+  replayTarget: '',
+  replaySpeed: 1,
+  replayRange: 300,
+  isReplaying: false,
+  replayPaused: false,
+  replayProgress: 0,
+  replayCurrentTime: 0,
+  replayTrajectory: [],
+  replayPosition: null
 };
 
 const canvas = document.getElementById('mapCanvas');
@@ -66,9 +77,13 @@ function yToLat(y) {
 function render() {
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   drawGrid();
+  if (state.showHeatmap && state.heatmapData) {
+    drawHeatmap();
+  }
   drawFences();
   drawPOIs();
   drawTrajectories();
+  drawReplayTrajectory();
   drawTargets();
   if (state.currentTool === 'draw-fence' && state.drawingVertices.length > 0) {
     drawDrawingFence();
@@ -115,6 +130,41 @@ function drawGrid() {
     lngToX(MAP_LNG_MAX) - lngToX(MAP_LNG_MIN),
     latToY(MAP_LAT_MIN) - latToY(MAP_LAT_MAX)
   );
+}
+
+function drawHeatmap() {
+  if (!state.heatmapData || !state.heatmapData.grid_data || !state.heatmapData.grid_data.cells) return;
+  
+  const cells = state.heatmapData.grid_data.cells;
+  const maxValue = state.heatmapData.grid_data.max_value || 1;
+  const lngStep = (MAP_LNG_MAX - MAP_LNG_MIN) / state.heatmapData.grid_lng_count;
+  const latStep = (MAP_LAT_MAX - MAP_LAT_MIN) / state.heatmapData.grid_lat_count;
+
+  cells.forEach(cell => {
+    const lng = MAP_LNG_MIN + cell.grid_x * lngStep;
+    const lat = MAP_LAT_MIN + cell.grid_y * latStep;
+    const x = lngToX(lng);
+    const y = latToY(lat + latStep);
+    const w = lngToX(lng + lngStep) - x;
+    const h = latToY(lat) - latToY(lat + latStep);
+
+    const intensity = cell.value / maxValue;
+    const alpha = Math.min(0.8, intensity * 0.8);
+    
+    let r, g, b;
+    if (intensity < 0.25) {
+      r = 0; g = 0; b = Math.floor(255 * (intensity * 4));
+    } else if (intensity < 0.5) {
+      r = 0; g = Math.floor(255 * ((intensity - 0.25) * 4)); b = 255;
+    } else if (intensity < 0.75) {
+      r = Math.floor(255 * ((intensity - 0.5) * 4)); g = 255; b = 255 - Math.floor(255 * ((intensity - 0.5) * 4));
+    } else {
+      r = 255; g = 255 - Math.floor(255 * ((intensity - 0.75) * 4)); b = 0;
+    }
+
+    ctx.fillStyle = `rgba(${r}, ${g}, ${b}, ${alpha})`;
+    ctx.fillRect(x, y, w, h);
+  });
 }
 
 function drawFences() {
@@ -203,6 +253,27 @@ function drawTrajectories() {
   });
 }
 
+function drawReplayTrajectory() {
+  if (!state.isReplaying || !state.replayTrajectory || state.replayTrajectory.length < 2) return;
+  
+  const target = state.targets.get(state.replayTarget);
+  const color = target ? target.color : '#4facfe';
+  const r = parseInt(color.slice(1, 3), 16);
+  const g = parseInt(color.slice(3, 5), 16);
+  const b = parseInt(color.slice(5, 7), 16);
+
+  for (let i = 1; i < state.replayTrajectory.length; i++) {
+    const p1 = state.replayTrajectory[i - 1];
+    const p2 = state.replayTrajectory[i];
+    ctx.beginPath();
+    ctx.moveTo(lngToX(p1.lng), latToY(p1.lat));
+    ctx.lineTo(lngToX(p2.lng), latToY(p2.lat));
+    ctx.strokeStyle = `rgba(${r}, ${g}, ${b}, 0.8)`;
+    ctx.lineWidth = 3;
+    ctx.stroke();
+  }
+}
+
 function drawTargets() {
   state.targets.forEach(target => {
     const x = lngToX(target.lng);
@@ -228,6 +299,30 @@ function drawTargets() {
     ctx.font = '10px sans-serif';
     ctx.fillText(target.name, x + 14, y + 4);
   });
+
+  if (state.isReplaying && state.replayPosition) {
+    const x = lngToX(state.replayPosition.lng);
+    const y = latToY(state.replayPosition.lat);
+    const size = 16;
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.rotate((state.replayPosition.bearing || 0) * Math.PI / 180);
+    ctx.beginPath();
+    ctx.moveTo(size, 0);
+    ctx.lineTo(-size * 0.6, size * 0.6);
+    ctx.lineTo(-size * 0.3, 0);
+    ctx.lineTo(-size * 0.6, -size * 0.6);
+    ctx.closePath();
+    ctx.fillStyle = '#ff6b6b';
+    ctx.fill();
+    ctx.strokeStyle = '#ffff00';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    ctx.restore();
+    ctx.fillStyle = '#ffff00';
+    ctx.font = 'bold 11px sans-serif';
+    ctx.fillText('回放: ' + (state.replayPosition.name || state.replayTarget), x + 18, y + 4);
+  }
 }
 
 function drawDrawingFence() {
@@ -471,6 +566,15 @@ document.getElementById('clearTrajectory').addEventListener('click', () => {
   render();
 });
 
+document.getElementById('toggleHeatmap').addEventListener('click', () => {
+  state.showHeatmap = !state.showHeatmap;
+  document.getElementById('toggleHeatmap').classList.toggle('active', state.showHeatmap);
+  render();
+  if (state.showHeatmap && !state.heatmapData) {
+    loadHeatmap();
+  }
+});
+
 document.getElementById('resetView').addEventListener('click', () => {
   state.scale = 1;
   state.offsetX = 0;
@@ -578,6 +682,125 @@ document.getElementById('deleteFence').addEventListener('click', () => {
   }
 });
 
+document.querySelectorAll('.speed-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.speed-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    state.replaySpeed = parseInt(btn.dataset.speed);
+  });
+});
+
+document.getElementById('replayRange').addEventListener('change', (e) => {
+  state.replayRange = parseInt(e.target.value);
+});
+
+document.getElementById('btnStartReplay').addEventListener('click', startReplay);
+document.getElementById('btnPauseReplay').addEventListener('click', togglePauseReplay);
+document.getElementById('btnStopReplay').addEventListener('click', stopReplay);
+
+async function startReplay() {
+  const targetId = document.getElementById('replayTarget').value;
+  if (!targetId) {
+    alert('请选择要回放的目标');
+    return;
+  }
+
+  const now = Date.now();
+  const startTime = now - state.replayRange * 1000;
+
+  try {
+    const res = await fetch('/api/replay/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        target_id: targetId,
+        start_time: startTime,
+        end_time: now,
+        speed: state.replaySpeed
+      })
+    });
+
+    if (!res.ok) {
+      const err = await res.json();
+      alert('启动回放失败: ' + err.error);
+      return;
+    }
+
+    const trajRes = await fetch(`/api/trajectory?target_id=${targetId}&start_time=${startTime}&end_time=${now}&interval=5`);
+    const trajData = await trajRes.json();
+    state.replayTrajectory = trajData.points || [];
+    state.replayTarget = targetId;
+    state.isReplaying = true;
+    state.replayPaused = false;
+
+    updateReplayControls();
+  } catch (e) {
+    alert('启动回放失败: ' + e.message);
+  }
+}
+
+function togglePauseReplay() {
+  if (!state.isReplaying) return;
+  
+  if (state.replayPaused) {
+    fetch('/api/replay/resume', { method: 'POST' });
+    state.replayPaused = false;
+  } else {
+    fetch('/api/replay/pause', { method: 'POST' });
+    state.replayPaused = true;
+  }
+  updateReplayControls();
+}
+
+function stopReplay() {
+  fetch('/api/replay/stop', { method: 'POST' });
+  state.isReplaying = false;
+  state.replayPaused = false;
+  state.replayPosition = null;
+  state.replayTrajectory = [];
+  state.replayProgress = 0;
+  state.replayCurrentTime = 0;
+  updateReplayControls();
+  updateReplayProgress();
+  render();
+}
+
+function updateReplayControls() {
+  document.getElementById('btnStartReplay').disabled = state.isReplaying;
+  document.getElementById('btnPauseReplay').disabled = !state.isReplaying;
+  document.getElementById('btnStopReplay').disabled = !state.isReplaying;
+  document.getElementById('btnPauseReplay').textContent = state.replayPaused ? '▶ 继续' : '⏸ 暂停';
+}
+
+function updateReplayProgress() {
+  const fill = document.getElementById('replayProgressFill');
+  const text = document.getElementById('replayProgressText');
+  const time = document.getElementById('replayCurrentTime');
+  
+  fill.style.width = state.replayProgress + '%';
+  text.textContent = Math.round(state.replayProgress) + '%';
+  
+  if (state.replayCurrentTime) {
+    const d = new Date(state.replayCurrentTime);
+    time.textContent = d.toLocaleTimeString();
+  } else {
+    time.textContent = '--:--:--';
+  }
+}
+
+function updateReplayTargetSelect() {
+  const select = document.getElementById('replayTarget');
+  const currentValue = select.value;
+  select.innerHTML = '<option value="">请选择目标</option>';
+  state.targets.forEach(target => {
+    const opt = document.createElement('option');
+    opt.value = target.id;
+    opt.textContent = target.name;
+    if (target.id === currentValue) opt.selected = true;
+    select.appendChild(opt);
+  });
+}
+
 async function loadFences() {
   const res = await fetch('/api/fences');
   state.fences = await res.json();
@@ -607,6 +830,18 @@ async function loadAlerts() {
   state.alerts = await res.json();
   updateAlertList();
   updateStatusBar();
+}
+
+async function loadHeatmap() {
+  try {
+    const res = await fetch('/api/heatmap');
+    state.heatmapData = await res.json();
+    if (state.showHeatmap) {
+      render();
+    }
+  } catch (e) {
+    console.error('加载热力图失败:', e);
+  }
 }
 
 async function createFence(name, type, color, vertices) {
@@ -776,9 +1011,12 @@ function updateTargetFilter() {
     if (target.id === currentValue) opt.selected = true;
     select.appendChild(opt);
   });
+  updateReplayTargetSelect();
 }
 
 function handlePositionUpdate(data) {
+  if (data.is_replay) return;
+  
   const existing = state.targets.get(data.id);
   if (existing) {
     if (!existing.trajectory) existing.trajectory = [];
@@ -803,6 +1041,20 @@ function handlePositionUpdate(data) {
     updateTargetFilter();
   }
   render();
+}
+
+function handleReplayPosition(data) {
+  state.replayPosition = data;
+  render();
+}
+
+function handleReplayProgress(data) {
+  state.replayProgress = data.progress_percent || 0;
+  state.replayCurrentTime = data.current_time || 0;
+  state.replayPaused = data.is_paused || false;
+  state.isReplaying = data.is_running || false;
+  updateReplayProgress();
+  updateReplayControls();
 }
 
 function handleAlert(data) {
@@ -857,6 +1109,24 @@ function connectWebSocket() {
       const msg = JSON.parse(event.data);
       if (msg.type === 'position') {
         handlePositionUpdate(msg.data);
+      } else if (msg.type === 'replay_position') {
+        handleReplayPosition(msg.data);
+      } else if (msg.type === 'replay_progress' || msg.type === 'replay_started') {
+        handleReplayProgress(msg.data);
+      } else if (msg.type === 'replay_stopped') {
+        if (msg.data.target_id === state.replayTarget) {
+          state.isReplaying = false;
+          state.replayPaused = false;
+          state.replayPosition = null;
+          state.replayTrajectory = [];
+          state.replayProgress = 0;
+          state.replayCurrentTime = 0;
+          updateReplayControls();
+          updateReplayProgress();
+          render();
+        }
+      } else if (msg.type === 'replay_paused' || msg.type === 'replay_resumed' || msg.type === 'replay_speed_changed') {
+        handleReplayProgress(msg.data);
       } else if (msg.type === 'alert') {
         handleAlert(msg.data);
       } else if (msg.type === 'poi_created') {
@@ -865,8 +1135,12 @@ function connectWebSocket() {
         loadPOIs();
       } else if (msg.type === 'fence_status') {
         state.fenceActiveStatus.set(msg.data.fence_id, msg.data.is_active);
-        console.log(`[FenceStatus] 围栏 ${msg.data.fence_name} 状态变更: ${msg.data.is_active ? '激活' : '停用'}`);
         render();
+      } else if (msg.type === 'heatmap_update') {
+        state.heatmapData = msg.data;
+        if (state.showHeatmap) {
+          render();
+        }
       } else if (msg.data && msg.data.type === 'cycle_warning') {
         console.warn('[CycleWarning]', msg.data.message);
       } else if (msg.data && msg.data.type === 'speed_limit') {

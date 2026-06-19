@@ -130,6 +130,39 @@ db.serialize(() => {
   db.run(`CREATE INDEX IF NOT EXISTS idx_bindings_group ON target_group_bindings(group_id)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_rules_fence ON fence_alert_rules(fence_id)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_actions_fence ON fence_actions(fence_id)`);
+  
+  db.run(`
+    CREATE TABLE IF NOT EXISTS trajectory_points (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      target_id TEXT NOT NULL,
+      target_name TEXT,
+      lng REAL NOT NULL,
+      lat REAL NOT NULL,
+      timestamp INTEGER NOT NULL,
+      group_id INTEGER,
+      group_name TEXT,
+      bearing REAL
+    )
+  `);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_trajectory_target ON trajectory_points(target_id)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_trajectory_timestamp ON trajectory_points(timestamp)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_trajectory_target_time ON trajectory_points(target_id, timestamp)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_trajectory_group ON trajectory_points(group_id)`);
+  
+  db.run(`
+    CREATE TABLE IF NOT EXISTS heatmap_snapshots (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      snapshot_time INTEGER NOT NULL,
+      grid_lng_count INTEGER NOT NULL DEFAULT 50,
+      grid_lat_count INTEGER NOT NULL DEFAULT 35,
+      lng_min REAL NOT NULL,
+      lng_max REAL NOT NULL,
+      lat_min REAL NOT NULL,
+      lat_max REAL NOT NULL,
+      grid_data TEXT NOT NULL
+    )
+  `);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_heatmap_time ON heatmap_snapshots(snapshot_time)`);
 });
 
 function run(sql, params = []) {
@@ -490,6 +523,174 @@ const FenceActivationOverrideModel = {
   }
 };
 
+const TrajectoryModel = {
+  async addPoint({ target_id, target_name, lng, lat, timestamp, group_id, group_name, bearing }) {
+    const result = await run(
+      'INSERT INTO trajectory_points (target_id, target_name, lng, lat, timestamp, group_id, group_name, bearing) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+      [target_id, target_name || null, lng, lat, timestamp, group_id || null, group_name || null, bearing || null]
+    );
+    return result.lastID;
+  },
+  async batchAddPoints(points) {
+    if (!points || points.length === 0) return 0;
+    const stmt = db.prepare('INSERT INTO trajectory_points (target_id, target_name, lng, lat, timestamp, group_id, group_name, bearing) VALUES (?, ?, ?, ?, ?, ?, ?, ?)');
+    return new Promise((resolve, reject) => {
+      db.serialize(() => {
+        db.run('BEGIN TRANSACTION');
+        let count = 0;
+        points.forEach(p => {
+          stmt.run(p.target_id, p.target_name || null, p.lng, p.lat, p.timestamp, p.group_id || null, p.group_name || null, p.bearing || null, function(err) {
+            if (err) {
+              db.run('ROLLBACK');
+              reject(err);
+            }
+            count++;
+          });
+        });
+        db.run('COMMIT', (err) => {
+          if (err) reject(err);
+          else resolve(count);
+        });
+      });
+    });
+  },
+  async query({ target_id, start_time, end_time, group_id, interval = 0, limit = 10000 }) {
+    let sql = 'SELECT * FROM trajectory_points WHERE 1=1';
+    const params = [];
+    if (target_id) { sql += ' AND target_id = ?'; params.push(target_id); }
+    if (group_id !== undefined && group_id !== null) { sql += ' AND group_id = ?'; params.push(group_id); }
+    if (start_time) { sql += ' AND timestamp >= ?'; params.push(start_time); }
+    if (end_time) { sql += ' AND timestamp <= ?'; params.push(end_time); }
+    
+    if (interval && interval > 0) {
+      sql = `
+        SELECT tp.* 
+        FROM trajectory_points tp
+        INNER JOIN (
+          SELECT MIN(id) as min_id
+          FROM trajectory_points
+          WHERE 1=1
+          ${target_id ? 'AND target_id = ?' : ''}
+          ${group_id !== undefined && group_id !== null ? 'AND group_id = ?' : ''}
+          ${start_time ? 'AND timestamp >= ?' : ''}
+          ${end_time ? 'AND timestamp <= ?' : ''}
+          GROUP BY (timestamp / ?)
+        ) grouped ON tp.id = grouped.min_id
+        ORDER BY tp.timestamp ASC
+        LIMIT ?
+      `;
+      const newParams = [];
+      if (target_id) newParams.push(target_id);
+      if (group_id !== undefined && group_id !== null) newParams.push(group_id);
+      if (start_time) newParams.push(start_time);
+      if (end_time) newParams.push(end_time);
+      newParams.push(interval * 1000);
+      newParams.push(limit);
+      return all(sql, newParams);
+    }
+    
+    sql += ' ORDER BY timestamp ASC LIMIT ?';
+    params.push(limit);
+    return all(sql, params);
+  },
+  async getStays({ target_id, start_time, end_time, stay_radius = 0.0005, min_duration = 60000 }) {
+    const points = await this.query({ target_id, start_time, end_time, limit: 100000 });
+    if (points.length < 2) return [];
+    
+    const stays = [];
+    let i = 0;
+    while (i < points.length) {
+      const startPoint = points[i];
+      let j = i + 1;
+      let maxDist = 0;
+      let centerLng = startPoint.lng;
+      let centerLat = startPoint.lat;
+      
+      while (j < points.length) {
+        const curr = points[j];
+        const dist = Math.sqrt(
+          Math.pow(curr.lng - startPoint.lng, 2) + 
+          Math.pow(curr.lat - startPoint.lat, 2)
+        );
+        if (dist > stay_radius) {
+          break;
+        }
+        const total = j - i + 1;
+        centerLng = ((centerLng * (total - 1)) + curr.lng) / total;
+        centerLat = ((centerLat * (total - 1)) + curr.lat) / total;
+        maxDist = Math.max(maxDist, dist);
+        j++;
+      }
+      
+      const duration = points[j - 1].timestamp - startPoint.timestamp;
+      if (duration >= min_duration) {
+        stays.push({
+          center_lng: centerLng,
+          center_lat: centerLat,
+          start_time: startPoint.timestamp,
+          end_time: points[j - 1].timestamp,
+          duration_seconds: Math.round(duration / 1000),
+          point_count: j - i
+        });
+        i = j;
+      } else {
+        i++;
+      }
+    }
+    return stays;
+  },
+  async getFenceEventRanking({ start_time, end_time, group_id, event_type, limit = 20 } = {}) {
+    let sql = `
+      SELECT 
+        fence_id, 
+        fence_name,
+        SUM(CASE WHEN event_type = 'enter' THEN 1 ELSE 0 END) as enter_count,
+        SUM(CASE WHEN event_type = 'leave' THEN 1 ELSE 0 END) as leave_count,
+        COUNT(*) as total_events
+      FROM alerts
+      WHERE 1=1
+    `;
+    const params = [];
+    if (start_time) { sql += ' AND timestamp >= ?'; params.push(start_time); }
+    if (end_time) { sql += ' AND timestamp <= ?'; params.push(end_time); }
+    if (group_id !== undefined && group_id !== null) { sql += ' AND group_id = ?'; params.push(group_id); }
+    if (event_type) { sql += ' AND event_type = ?'; params.push(event_type); }
+    
+    sql += ' GROUP BY fence_id, fence_name ORDER BY total_events DESC LIMIT ?';
+    params.push(limit);
+    return all(sql, params);
+  }
+};
+
+const HeatmapModel = {
+  async saveSnapshot({ snapshot_time, grid_lng_count, grid_lat_count, lng_min, lng_max, lat_min, lat_max, grid_data }) {
+    const result = await run(
+      'INSERT INTO heatmap_snapshots (snapshot_time, grid_lng_count, grid_lat_count, lng_min, lng_max, lat_min, lat_max, grid_data) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+      [snapshot_time, grid_lng_count, grid_lat_count, lng_min, lng_max, lat_min, lat_max, JSON.stringify(grid_data)]
+    );
+    return result.lastID;
+  },
+  async getLatest() {
+    const row = await get('SELECT * FROM heatmap_snapshots ORDER BY snapshot_time DESC LIMIT 1');
+    if (!row) return null;
+    return {
+      ...row,
+      grid_data: JSON.parse(row.grid_data)
+    };
+  },
+  async getByTime(timestamp) {
+    const row = await get(
+      'SELECT * FROM heatmap_snapshots WHERE snapshot_time <= ? ORDER BY snapshot_time DESC LIMIT 1',
+      [timestamp]
+    );
+    if (!row) return null;
+    return {
+      ...row,
+      grid_data: JSON.parse(row.grid_data)
+    };
+  }
+};
+
 module.exports = {
   db,
   FenceModel,
@@ -500,5 +701,7 @@ module.exports = {
   FenceTimeWindowModel,
   FenceAlertRuleModel,
   FenceActionModel,
-  FenceActivationOverrideModel
+  FenceActivationOverrideModel,
+  TrajectoryModel,
+  HeatmapModel
 };

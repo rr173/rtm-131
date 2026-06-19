@@ -12,12 +12,16 @@ const {
   FenceTimeWindowModel,
   FenceAlertRuleModel,
   FenceActionModel,
-  FenceActivationOverrideModel
+  FenceActivationOverrideModel,
+  TrajectoryModel,
+  HeatmapModel
 } = require('./database');
 const { FenceEngine } = require('./fenceEngine');
 const { GPSSimulator } = require('./gpsSimulator');
 const { isPolygonSelfIntersecting } = require('./geometry');
 const { initPresetData } = require('./presetData');
+const { HeatmapManager } = require('./heatmapManager');
+const { ReplayManager } = require('./replayManager');
 
 const app = express();
 const server = http.createServer(app);
@@ -44,6 +48,8 @@ function broadcast(data) {
 
 let fenceEngine;
 let gpsSimulator;
+let heatmapManager;
+let replayManager;
 
 async function main() {
   await initPresetData(FenceModel, POIModel, TargetGroupModel, TargetBindingModel, FenceTimeWindowModel, FenceAlertRuleModel, FenceActionModel);
@@ -58,17 +64,29 @@ async function main() {
   );
   await fenceEngine.reloadFences();
 
-  gpsSimulator = new GPSSimulator(async (position) => {
-    fenceEngine.processPositionUpdate(position);
-    const binding = await TargetBindingModel.getBinding(position.id);
-    const posWithGroup = {
-      ...position,
-      group_id: binding ? binding.group_id : null,
-      group_name: binding ? binding.group_name : null,
-      group_color: binding ? binding.group_color : null
-    };
-    broadcast({ type: 'position', data: posWithGroup });
+  replayManager = new ReplayManager(
+    broadcast,
+    (targetId) => gpsSimulator.getTargetState(targetId),
+    async (targetId) => await TargetBindingModel.getBinding(targetId)
+  );
+
+  heatmapManager = new HeatmapManager((heatmapData) => {
+    broadcast({ type: 'heatmap_update', data: heatmapData });
   });
+
+  gpsSimulator = new GPSSimulator(async (position) => {
+    if (!replayManager.isTargetInReplay(position.id)) {
+      fenceEngine.processPositionUpdate(position);
+      const binding = await TargetBindingModel.getBinding(position.id);
+      const posWithGroup = {
+        ...position,
+        group_id: binding ? binding.group_id : null,
+        group_name: binding ? binding.group_name : null,
+        group_color: binding ? binding.group_color : null
+      };
+      broadcast({ type: 'position', data: posWithGroup });
+    }
+  }, { enableTrajectoryPersistence: true });
 
   wss.on('connection', async (ws) => {
     clients.add(ws);
@@ -96,6 +114,14 @@ async function main() {
     fenceEngine.getAllFenceStatus().forEach(status => {
       ws.send(JSON.stringify({ type: 'fence_status', data: status }));
     });
+    const latestHeatmap = heatmapManager.getLatest();
+    if (latestHeatmap) {
+      ws.send(JSON.stringify({ type: 'heatmap_update', data: latestHeatmap }));
+    }
+    const currentReplay = replayManager.getCurrentReplay();
+    if (currentReplay) {
+      ws.send(JSON.stringify({ type: 'replay_started', data: currentReplay }));
+    }
     ws.on('close', () => {
       clients.delete(ws);
       console.log(`[WS] 客户端断开，当前连接数: ${clients.size}`);
@@ -436,7 +462,8 @@ async function main() {
       online_targets: targets.length,
       total_alerts: await AlertModel.getTodayCount(),
       ws_connections: clients.size,
-      simulator_running: gpsSimulator.isRunning
+      simulator_running: gpsSimulator.isRunning,
+      replay_active: replayManager.isReplaying()
     });
   });
 
@@ -461,18 +488,237 @@ async function main() {
     res.json({ success: true });
   });
 
+  app.get('/api/trajectory', async (req, res) => {
+    const { target_id, start_time, end_time, group_id, interval, limit } = req.query;
+    if (!target_id) {
+      return res.status(400).json({ error: '需要指定target_id' });
+    }
+    try {
+      const points = await TrajectoryModel.query({
+        target_id,
+        start_time: start_time ? parseInt(start_time) : undefined,
+        end_time: end_time ? parseInt(end_time) : undefined,
+        group_id: group_id !== undefined ? parseInt(group_id) : undefined,
+        interval: interval ? parseInt(interval) : 0,
+        limit: limit ? parseInt(limit) : 10000
+      });
+      res.json({
+        target_id,
+        count: points.length,
+        points
+      });
+    } catch (err) {
+      console.error('[API] 轨迹查询失败:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.get('/api/trajectory/stays', async (req, res) => {
+    const { target_id, start_time, end_time, stay_radius, min_duration } = req.query;
+    if (!target_id) {
+      return res.status(400).json({ error: '需要指定target_id' });
+    }
+    try {
+      const stays = await TrajectoryModel.getStays({
+        target_id,
+        start_time: start_time ? parseInt(start_time) : undefined,
+        end_time: end_time ? parseInt(end_time) : undefined,
+        stay_radius: stay_radius ? parseFloat(stay_radius) : 0.0005,
+        min_duration: min_duration ? parseInt(min_duration) : 60000
+      });
+      res.json({
+        target_id,
+        count: stays.length,
+        stays
+      });
+    } catch (err) {
+      console.error('[API] 停留点分析失败:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.get('/api/replay/status', (req, res) => {
+    try {
+      const status = replayManager.getCurrentReplay();
+      res.json(status || { is_running: false });
+    } catch (err) {
+      console.error('[API] 获取回放状态失败:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.post('/api/replay/start', async (req, res) => {
+    const { target_id, start_time, end_time, speed } = req.body;
+    if (!target_id) {
+      return res.status(400).json({ error: '需要指定target_id' });
+    }
+    if (!start_time || !end_time) {
+      return res.status(400).json({ error: '需要指定start_time和end_time' });
+    }
+    try {
+      const result = await replayManager.startReplay({
+        target_id,
+        start_time: parseInt(start_time),
+        end_time: parseInt(end_time),
+        speed: speed ? parseInt(speed) : 1
+      });
+      res.json(result);
+    } catch (err) {
+      console.error('[API] 启动回放失败:', err);
+      if (err.message === '当前已有回放任务在进行中，请先停止') {
+        res.status(409).json({ error: err.message });
+      } else {
+        res.status(400).json({ error: err.message });
+      }
+    }
+  });
+
+  app.post('/api/replay/pause', (req, res) => {
+    try {
+      const result = replayManager.pauseReplay();
+      res.json(result);
+    } catch (err) {
+      console.error('[API] 暂停回放失败:', err);
+      res.status(400).json({ error: err.message });
+    }
+  });
+
+  app.post('/api/replay/resume', (req, res) => {
+    try {
+      const result = replayManager.resumeReplay();
+      res.json(result);
+    } catch (err) {
+      console.error('[API] 恢复回放失败:', err);
+      res.status(400).json({ error: err.message });
+    }
+  });
+
+  app.post('/api/replay/seek', (req, res) => {
+    const { index } = req.body;
+    if (index === undefined) {
+      return res.status(400).json({ error: '需要指定index' });
+    }
+    try {
+      const result = replayManager.seekToIndex(parseInt(index));
+      res.json(result);
+    } catch (err) {
+      console.error('[API] 跳转回放失败:', err);
+      res.status(400).json({ error: err.message });
+    }
+  });
+
+  app.post('/api/replay/speed', (req, res) => {
+    const { speed } = req.body;
+    if (speed === undefined) {
+      return res.status(400).json({ error: '需要指定speed' });
+    }
+    try {
+      const result = replayManager.setSpeed(parseInt(speed));
+      res.json(result);
+    } catch (err) {
+      console.error('[API] 设置回放速度失败:', err);
+      res.status(400).json({ error: err.message });
+    }
+  });
+
+  app.post('/api/replay/stop', (req, res) => {
+    try {
+      const result = replayManager.stopReplay();
+      res.json(result);
+    } catch (err) {
+      console.error('[API] 停止回放失败:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.get('/api/heatmap', async (req, res) => {
+    try {
+      const latest = await heatmapManager.getLatestSnapshot();
+      if (!latest) {
+        return res.json({ cells: [], max_value: 0, total_points: 0 });
+      }
+      res.json(latest);
+    } catch (err) {
+      console.error('[API] 获取热力图失败:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.post('/api/heatmap/refresh', async (req, res) => {
+    try {
+      const result = await heatmapManager.aggregateHeatmap();
+      res.json({ success: true, data: result });
+    } catch (err) {
+      console.error('[API] 刷新热力图失败:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.get('/api/fence-event-ranking', async (req, res) => {
+    const { start_time, end_time, group_id, event_type, limit, range } = req.query;
+    let startTime, endTime;
+    const now = Date.now();
+
+    if (range === 'today') {
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+      startTime = today.getTime();
+      endTime = now;
+    } else if (range === 'week') {
+      const weekAgo = new Date(now - 7 * 24 * 60 * 60 * 1000);
+      startTime = weekAgo.getTime();
+      endTime = now;
+    } else {
+      startTime = start_time ? parseInt(start_time) : undefined;
+      endTime = end_time ? parseInt(end_time) : undefined;
+    }
+
+    try {
+      const ranking = await TrajectoryModel.getFenceEventRanking({
+        start_time: startTime,
+        end_time: endTime,
+        group_id: group_id !== undefined && group_id !== '' ? parseInt(group_id) : undefined,
+        event_type: event_type || undefined,
+        limit: limit ? parseInt(limit) : 20
+      });
+      res.json({
+        range: range || 'custom',
+        start_time: startTime,
+        end_time: endTime,
+        count: ranking.length,
+        ranking
+      });
+    } catch (err) {
+      console.error('[API] 围栏事件排名失败:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   const PORT = process.env.PORT || 3000;
 
-  server.listen(PORT, () => {
+  server.listen(PORT, async () => {
     console.log(`[Server] 服务已启动，端口: ${PORT}`);
     console.log(`[Server] http://localhost:${PORT}`);
+
+    console.log('[Data] 正在生成历史轨迹数据...');
+    try {
+      await gpsSimulator.generateHistoricalTrajectory(300);
+    } catch (err) {
+      console.error('[Data] 生成历史轨迹数据失败:', err.message);
+    }
+
     gpsSimulator.start();
     console.log('[GPS] 模拟器已启动，5个目标正在移动');
+
+    heatmapManager.start();
+    console.log('[Heatmap] 热力聚合器已启动');
   });
 
   process.on('SIGINT', () => {
     console.log('\n[Server] 正在关闭...');
     gpsSimulator.stop();
+    heatmapManager.stop();
+    replayManager.stopReplay();
     server.close(() => {
       console.log('[Server] 已关闭');
       process.exit(0);

@@ -1,4 +1,5 @@
 const { distance } = require('./geometry');
+const { TrajectoryModel, TargetBindingModel } = require('./database');
 
 const targets = [
   {
@@ -86,8 +87,9 @@ const targets = [
 ];
 
 class GPSSimulator {
-  constructor(onPositionUpdate) {
+  constructor(onPositionUpdate, { enableTrajectoryPersistence = true } = {}) {
     this.onPositionUpdate = onPositionUpdate;
+    this.enableTrajectoryPersistence = enableTrajectoryPersistence;
     this.targetStates = new Map();
     this.isRunning = false;
     this.intervalId = null;
@@ -121,7 +123,8 @@ class GPSSimulator {
     }
   }
 
-  tick() {
+  async tick() {
+    const promises = [];
     this.targetStates.forEach((state, targetId) => {
       this.moveTarget(state);
       const posUpdate = {
@@ -140,7 +143,33 @@ class GPSSimulator {
       if (this.onPositionUpdate) {
         this.onPositionUpdate(posUpdate);
       }
+      if (this.enableTrajectoryPersistence) {
+        promises.push(this.persistPosition(posUpdate));
+      }
     });
+    if (promises.length > 0) {
+      Promise.all(promises).catch(err => {
+        console.error('[GPS] 轨迹持久化失败:', err.message);
+      });
+    }
+  }
+
+  async persistPosition(posUpdate) {
+    try {
+      const binding = await TargetBindingModel.getBinding(posUpdate.id);
+      await TrajectoryModel.addPoint({
+        target_id: posUpdate.id,
+        target_name: posUpdate.name,
+        lng: posUpdate.lng,
+        lat: posUpdate.lat,
+        timestamp: posUpdate.timestamp,
+        group_id: binding ? binding.group_id : null,
+        group_name: binding ? binding.group_name : null,
+        bearing: posUpdate.bearing
+      });
+    } catch (err) {
+      console.error(`[GPS] 持久化位置 ${posUpdate.id} 失败:`, err.message);
+    }
   }
 
   moveTarget(state) {
@@ -166,6 +195,169 @@ class GPSSimulator {
     state.currentPos.lng = p1.lng + (p2.lng - p1.lng) * t;
     state.currentPos.lat = p1.lat + (p2.lat - p1.lat) * t;
     state.bearing = Math.atan2(p2.lat - p1.lat, p2.lng - p1.lng) * 180 / Math.PI;
+  }
+
+  calculatePositionAtTime(targetId, timestamp, baseTime = Date.now()) {
+    const state = this.targetStates.get(targetId);
+    if (!state) return null;
+
+    const route = state.route;
+    const totalSegments = route.length;
+    const timeDiff = timestamp - baseTime;
+    const secondsDiff = timeDiff / 1000;
+
+    let segIdx = state.segmentIndex;
+    let segProgress = state.segmentProgress;
+
+    const segLengths = [];
+    let totalLength = 0;
+    for (let i = 0; i < totalSegments; i++) {
+      const p1 = route[i];
+      const p2 = route[(i + 1) % totalSegments];
+      const len = distance(p1, p2);
+      segLengths.push(len);
+      totalLength += len;
+    }
+
+    const speedPerSecond = state.speed;
+    let distanceToTravel = Math.abs(secondsDiff) * speedPerSecond;
+    const direction = secondsDiff >= 0 ? 1 : -1;
+
+    if (direction > 0) {
+      while (distanceToTravel > 0) {
+        const currentSegLen = segLengths[segIdx];
+        const remainingInSeg = (1 - segProgress) * currentSegLen;
+        if (distanceToTravel < remainingInSeg) {
+          segProgress += distanceToTravel / currentSegLen;
+          distanceToTravel = 0;
+        } else {
+          distanceToTravel -= remainingInSeg;
+          segIdx = (segIdx + 1) % totalSegments;
+          segProgress = 0;
+        }
+      }
+    } else {
+      while (distanceToTravel > 0) {
+        if (segProgress > 0) {
+          const currentSegLen = segLengths[segIdx];
+          const progressInSeg = segProgress * currentSegLen;
+          if (distanceToTravel < progressInSeg) {
+            segProgress -= distanceToTravel / currentSegLen;
+            distanceToTravel = 0;
+          } else {
+            distanceToTravel -= progressInSeg;
+            segIdx = (segIdx - 1 + totalSegments) % totalSegments;
+            segProgress = 1;
+          }
+        } else {
+          segIdx = (segIdx - 1 + totalSegments) % totalSegments;
+          segProgress = 1;
+        }
+      }
+    }
+
+    const p1 = route[segIdx];
+    const p2 = route[(segIdx + 1) % totalSegments];
+    const t = segProgress;
+    const lng = p1.lng + (p2.lng - p1.lng) * t;
+    const lat = p1.lat + (p2.lat - p1.lat) * t;
+    const bearing = Math.atan2(p2.lat - p1.lat, p2.lng - p1.lng) * 180 / Math.PI;
+
+    return {
+      lng,
+      lat,
+      bearing,
+      segmentIndex: segIdx,
+      segmentProgress: segProgress
+    };
+  }
+
+  async generateHistoricalTrajectory(durationSeconds = 300) {
+    const now = Date.now();
+    const startTime = now - durationSeconds * 1000;
+    const allPoints = [];
+    const bindingsMap = new Map();
+
+    for (const target of targets) {
+      const binding = await TargetBindingModel.getBinding(target.id);
+      bindingsMap.set(target.id, binding);
+    }
+
+    for (const target of targets) {
+      const state = this.targetStates.get(target.id);
+      if (!state) continue;
+
+      const binding = bindingsMap.get(target.id);
+      const route = target.route;
+      const totalSegments = route.length;
+
+      const segLengths = [];
+      let totalLength = 0;
+      for (let i = 0; i < totalSegments; i++) {
+        const p1 = route[i];
+        const p2 = route[(i + 1) % totalSegments];
+        const len = distance(p1, p2);
+        segLengths.push(len);
+        totalLength += len;
+      }
+
+      const speedPerSecond = state.speed;
+      const totalDistance = speedPerSecond * durationSeconds;
+
+      let segIdx = state.segmentIndex;
+      let segProgress = state.segmentProgress;
+      let remainingDist = totalDistance;
+
+      while (remainingDist > 0) {
+        const currentSegLen = segLengths[segIdx];
+        const progressInSeg = segProgress * currentSegLen;
+        if (remainingDist < progressInSeg) {
+          segProgress -= remainingDist / currentSegLen;
+          remainingDist = 0;
+        } else {
+          remainingDist -= progressInSeg;
+          segIdx = (segIdx - 1 + totalSegments) % totalSegments;
+          segProgress = 1;
+        }
+      }
+
+      for (let sec = 0; sec <= durationSeconds; sec++) {
+        const ts = startTime + sec * 1000;
+
+        const p1 = route[segIdx];
+        const p2 = route[(segIdx + 1) % totalSegments];
+        const t = segProgress;
+        const lng = p1.lng + (p2.lng - p1.lng) * t;
+        const lat = p1.lat + (p2.lat - p1.lat) * t;
+        const bearing = Math.atan2(p2.lat - p1.lat, p2.lng - p1.lng) * 180 / Math.PI;
+
+        allPoints.push({
+          target_id: target.id,
+          target_name: target.name,
+          lng,
+          lat,
+          timestamp: ts,
+          group_id: binding ? binding.group_id : null,
+          group_name: binding ? binding.group_name : null,
+          bearing
+        });
+
+        const currentSegLen = segLengths[segIdx];
+        const progressPerTick = speedPerSecond / currentSegLen;
+        segProgress += progressPerTick;
+        if (segProgress >= 1) {
+          segProgress = segProgress - 1;
+          segIdx = (segIdx + 1) % totalSegments;
+        }
+      }
+    }
+
+    if (allPoints.length > 0) {
+      await TrajectoryModel.batchAddPoints(allPoints);
+    }
+
+    console.log(`[GPS] 已生成 ${durationSeconds} 秒历史轨迹数据，共 ${allPoints.length} 个点`);
+    return allPoints.length;
   }
 
   getTargetState(targetId) {
