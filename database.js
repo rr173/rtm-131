@@ -265,6 +265,47 @@ db.serialize(() => {
   `);
   db.run(`CREATE INDEX IF NOT EXISTS idx_patrol_wp_task ON patrol_waypoints(task_id)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_patrol_wp_fence ON patrol_waypoints(fence_id)`);
+
+  db.run(`
+    CREATE TABLE IF NOT EXISTS target_behavior_profiles (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      target_id TEXT NOT NULL,
+      target_name TEXT,
+      profile_date TEXT NOT NULL,
+      common_routes TEXT NOT NULL,
+      common_stay_areas TEXT NOT NULL,
+      active_hours TEXT NOT NULL,
+      total_points INTEGER NOT NULL DEFAULT 0,
+      data_start_time INTEGER NOT NULL,
+      data_end_time INTEGER NOT NULL,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      UNIQUE(target_id, profile_date)
+    )
+  `);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_profile_target ON target_behavior_profiles(target_id)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_profile_date ON target_behavior_profiles(profile_date)`);
+
+  db.run(`
+    CREATE TABLE IF NOT EXISTS behavior_anomaly_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      target_id TEXT NOT NULL,
+      target_name TEXT,
+      anomaly_type TEXT NOT NULL CHECK(anomaly_type IN ('route_deviation', 'area_anomaly', 'time_anomaly')),
+      description TEXT NOT NULL,
+      lng REAL NOT NULL,
+      lat REAL NOT NULL,
+      timestamp INTEGER NOT NULL,
+      details TEXT,
+      group_id INTEGER,
+      group_name TEXT,
+      created_at INTEGER NOT NULL
+    )
+  `);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_anomaly_target ON behavior_anomaly_events(target_id)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_anomaly_type ON behavior_anomaly_events(anomaly_type)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_anomaly_timestamp ON behavior_anomaly_events(timestamp)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_anomaly_target_type ON behavior_anomaly_events(target_id, anomaly_type)`);
 });
 
 function run(sql, params = []) {
@@ -1208,6 +1249,178 @@ const PatrolTaskModel = {
   }
 };
 
+const BehaviorProfileModel = {
+  async upsert({ target_id, target_name, profile_date, common_routes, common_stay_areas, active_hours, total_points, data_start_time, data_end_time }) {
+    const now = Date.now();
+    const existing = await this.getByTargetAndDate(target_id, profile_date);
+    if (existing) {
+      await run(
+        `UPDATE target_behavior_profiles SET 
+          target_name = ?, common_routes = ?, common_stay_areas = ?, 
+          active_hours = ?, total_points = ?, data_start_time = ?, 
+          data_end_time = ?, updated_at = ? 
+         WHERE target_id = ? AND profile_date = ?`,
+        [target_name || null, JSON.stringify(common_routes), JSON.stringify(common_stay_areas),
+         JSON.stringify(active_hours), total_points, data_start_time,
+         data_end_time, now, target_id, profile_date]
+      );
+      return this.getByTargetAndDate(target_id, profile_date);
+    } else {
+      const result = await run(
+        `INSERT INTO target_behavior_profiles 
+          (target_id, target_name, profile_date, common_routes, common_stay_areas, 
+           active_hours, total_points, data_start_time, data_end_time, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [target_id, target_name || null, profile_date, JSON.stringify(common_routes), 
+         JSON.stringify(common_stay_areas), JSON.stringify(active_hours), total_points, 
+         data_start_time, data_end_time, now, now]
+      );
+      return this.getById(result.lastID);
+    }
+  },
+
+  async getById(id) {
+    const row = await get('SELECT * FROM target_behavior_profiles WHERE id = ?', [id]);
+    if (!row) return null;
+    return this._parseRow(row);
+  },
+
+  async getByTargetAndDate(target_id, profile_date) {
+    const row = await get(
+      'SELECT * FROM target_behavior_profiles WHERE target_id = ? AND profile_date = ?',
+      [target_id, profile_date]
+    );
+    if (!row) return null;
+    return this._parseRow(row);
+  },
+
+  async getLatestByTarget(target_id) {
+    const row = await get(
+      'SELECT * FROM target_behavior_profiles WHERE target_id = ? ORDER BY profile_date DESC, updated_at DESC LIMIT 1',
+      [target_id]
+    );
+    if (!row) return null;
+    return this._parseRow(row);
+  },
+
+  async getAllLatest() {
+    const rows = await all(`
+      SELECT p.* 
+      FROM target_behavior_profiles p
+      INNER JOIN (
+        SELECT target_id, MAX(profile_date) as max_date, MAX(updated_at) as max_updated
+        FROM target_behavior_profiles
+        GROUP BY target_id
+      ) latest ON p.target_id = latest.target_id 
+        AND p.profile_date = latest.max_date 
+        AND p.updated_at = latest.max_updated
+    `);
+    return rows.map(row => this._parseRow(row));
+  },
+
+  async getByTarget(target_id, limit = 30) {
+    const rows = await all(
+      'SELECT * FROM target_behavior_profiles WHERE target_id = ? ORDER BY profile_date DESC LIMIT ?',
+      [target_id, limit]
+    );
+    return rows.map(row => this._parseRow(row));
+  },
+
+  _parseRow(row) {
+    return {
+      ...row,
+      common_routes: JSON.parse(row.common_routes),
+      common_stay_areas: JSON.parse(row.common_stay_areas),
+      active_hours: JSON.parse(row.active_hours)
+    };
+  }
+};
+
+const BehaviorAnomalyModel = {
+  async create({ target_id, target_name, anomaly_type, description, lng, lat, timestamp, details, group_id, group_name }) {
+    const now = Date.now();
+    const result = await run(
+      `INSERT INTO behavior_anomaly_events 
+        (target_id, target_name, anomaly_type, description, lng, lat, timestamp, details, group_id, group_name, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [target_id, target_name || null, anomaly_type, description, lng, lat, timestamp,
+       details ? JSON.stringify(details) : null, group_id || null, group_name || null, now]
+    );
+    return this.getById(result.lastID);
+  },
+
+  async getById(id) {
+    const row = await get('SELECT * FROM behavior_anomaly_events WHERE id = ?', [id]);
+    if (!row) return null;
+    return this._parseRow(row);
+  },
+
+  async query({ target_id, anomaly_type, start_time, end_time, group_id, limit = 100, offset = 0 } = {}) {
+    let sql = 'SELECT * FROM behavior_anomaly_events WHERE 1=1';
+    const params = [];
+    if (target_id) { sql += ' AND target_id = ?'; params.push(target_id); }
+    if (anomaly_type) { sql += ' AND anomaly_type = ?'; params.push(anomaly_type); }
+    if (group_id !== undefined && group_id !== null) { sql += ' AND group_id = ?'; params.push(group_id); }
+    if (start_time) { sql += ' AND timestamp >= ?'; params.push(start_time); }
+    if (end_time) { sql += ' AND timestamp <= ?'; params.push(end_time); }
+    sql += ' ORDER BY timestamp DESC LIMIT ? OFFSET ?';
+    params.push(limit, offset);
+    const rows = await all(sql, params);
+    return rows.map(row => this._parseRow(row));
+  },
+
+  async getTargetStats(start_time, end_time) {
+    let sql = `
+      SELECT 
+        target_id,
+        target_name,
+        COUNT(*) as total_anomalies,
+        SUM(CASE WHEN anomaly_type = 'route_deviation' THEN 1 ELSE 0 END) as route_deviation_count,
+        SUM(CASE WHEN anomaly_type = 'area_anomaly' THEN 1 ELSE 0 END) as area_anomaly_count,
+        SUM(CASE WHEN anomaly_type = 'time_anomaly' THEN 1 ELSE 0 END) as time_anomaly_count
+      FROM behavior_anomaly_events
+      WHERE 1=1
+    `;
+    const params = [];
+    if (start_time) { sql += ' AND timestamp >= ?'; params.push(start_time); }
+    if (end_time) { sql += ' AND timestamp <= ?'; params.push(end_time); }
+    sql += ' GROUP BY target_id, target_name ORDER BY total_anomalies DESC';
+    return all(sql, params);
+  },
+
+  async getTypeDistribution(start_time, end_time) {
+    let sql = `
+      SELECT 
+        anomaly_type,
+        COUNT(*) as count,
+        COUNT(DISTINCT target_id) as target_count
+      FROM behavior_anomaly_events
+      WHERE 1=1
+    `;
+    const params = [];
+    if (start_time) { sql += ' AND timestamp >= ?'; params.push(start_time); }
+    if (end_time) { sql += ' AND timestamp <= ?'; params.push(end_time); }
+    sql += ' GROUP BY anomaly_type ORDER BY count DESC';
+    return all(sql, params);
+  },
+
+  async getLatestByTargetAndType(target_id, anomaly_type) {
+    const row = await get(
+      'SELECT * FROM behavior_anomaly_events WHERE target_id = ? AND anomaly_type = ? ORDER BY timestamp DESC LIMIT 1',
+      [target_id, anomaly_type]
+    );
+    if (!row) return null;
+    return this._parseRow(row);
+  },
+
+  _parseRow(row) {
+    return {
+      ...row,
+      details: row.details ? JSON.parse(row.details) : null
+    };
+  }
+};
+
 module.exports = {
   db,
   FenceModel,
@@ -1224,5 +1437,7 @@ module.exports = {
   DutyScheduleModel,
   WorkOrderModel,
   WorkOrderEscalationModel,
-  PatrolTaskModel
+  PatrolTaskModel,
+  BehaviorProfileModel,
+  BehaviorAnomalyModel
 };

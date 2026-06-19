@@ -18,7 +18,9 @@ const {
   DutyScheduleModel,
   WorkOrderModel,
   WorkOrderEscalationModel,
-  PatrolTaskModel
+  PatrolTaskModel,
+  BehaviorProfileModel,
+  BehaviorAnomalyModel
 } = require('./database');
 const { FenceEngine } = require('./fenceEngine');
 const { WorkOrderEngine } = require('./workOrderEngine');
@@ -28,6 +30,7 @@ const { initPresetData } = require('./presetData');
 const { HeatmapManager } = require('./heatmapManager');
 const { ReplayManager } = require('./replayManager');
 const { PatrolEngine } = require('./patrolEngine');
+const { BehaviorEngine } = require('./behaviorEngine');
 
 const app = express();
 const server = http.createServer(app);
@@ -58,6 +61,7 @@ let heatmapManager;
 let replayManager;
 let workOrderEngine;
 let patrolEngine;
+let behaviorEngine;
 
 async function main() {
   await initPresetData(FenceModel, POIModel, TargetGroupModel, TargetBindingModel, FenceTimeWindowModel, FenceAlertRuleModel, FenceActionModel, DutyScheduleModel, WorkOrderModel, WorkOrderEscalationModel, AlertModel, PatrolTaskModel);
@@ -102,10 +106,23 @@ async function main() {
     broadcast({ type: 'heatmap_update', data: heatmapData });
   });
 
+  behaviorEngine = new BehaviorEngine(
+    (anomaly) => {
+      broadcast({ type: 'behavior_anomaly', data: anomaly });
+    },
+    (profile) => {
+      broadcast({ type: 'behavior_profile_update', data: profile });
+    }
+  );
+  await behaviorEngine.init();
+
   gpsSimulator = new GPSSimulator(async (position) => {
     if (!replayManager.isTargetInReplay(position.id)) {
       fenceEngine.processPositionUpdate(position);
       patrolEngine.processPositionUpdate(position);
+      behaviorEngine.processPositionUpdate(position).catch(err => {
+        console.error('[Behavior] 异常检测处理失败:', err.message);
+      });
       const binding = await TargetBindingModel.getBinding(position.id);
       const posWithGroup = {
         ...position,
@@ -515,6 +532,11 @@ async function main() {
     const escalatedOrders = await WorkOrderModel.query({ status: 'escalated', limit: 1 });
     const patrolTasks = await PatrolTaskModel.count();
     const activePatrolTasks = patrolEngine ? patrolEngine.getAllActiveProgress().length : 0;
+    const behaviorProfiles = behaviorEngine ? behaviorEngine.getAllProfiles() : [];
+    const todayAnomalies = await BehaviorAnomalyModel.query({
+      start_time: new Date().setHours(0, 0, 0, 0),
+      limit: 1
+    });
     res.json({
       online_targets: targets.length,
       total_alerts: await AlertModel.getTodayCount(),
@@ -527,7 +549,10 @@ async function main() {
       simulator_running: gpsSimulator.isRunning,
       replay_active: replayManager.isReplaying(),
       escalation_scanner_running: workOrderEngine ? workOrderEngine.escalationTimer !== null : false,
-      patrol_scheduler_running: patrolEngine ? patrolEngine.isRunning : false
+      patrol_scheduler_running: patrolEngine ? patrolEngine.isRunning : false,
+      behavior_profile_count: behaviorProfiles.length,
+      today_behavior_anomalies: todayAnomalies.length,
+      behavior_hourly_update_running: behaviorEngine ? behaviorEngine.hourlyTimer !== null : false
     });
   });
 
@@ -1116,7 +1141,136 @@ async function main() {
       );
       res.json(stats);
     } catch (err) {
-      console.error('[API] 获取围栏覆盖统计失败:', err);
+      console.error('[API] 获取围栏覆盖统计失败:', err.message);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.get('/api/behavior-profiles', async (req, res) => {
+    try {
+      const profiles = behaviorEngine.getAllProfiles();
+      res.json({ count: profiles.length, profiles });
+    } catch (err) {
+      console.error('[API] 获取行为画像列表失败:', err.message);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.get('/api/behavior-profiles/:target_id', async (req, res) => {
+    try {
+      const { target_id } = req.params;
+      const { limit } = req.query;
+      if (limit !== undefined) {
+        const profiles = await BehaviorProfileModel.getByTarget(target_id, parseInt(limit));
+        res.json({ target_id, count: profiles.length, profiles });
+      } else {
+        const profile = behaviorEngine.getProfile(target_id);
+        if (!profile) {
+          return res.status(404).json({ error: '未找到该目标的行为画像' });
+        }
+        res.json(profile);
+      }
+    } catch (err) {
+      console.error('[API] 获取行为画像失败:', err.message);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.post('/api/behavior-profiles/refresh', async (req, res) => {
+    try {
+      const count = await behaviorEngine.updateAllProfiles();
+      res.json({ success: true, updated_count: count });
+    } catch (err) {
+      console.error('[API] 刷新行为画像失败:', err.message);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.post('/api/behavior-profiles/:target_id/refresh', async (req, res) => {
+    try {
+      const { target_id } = req.params;
+      const profile = await behaviorEngine.buildProfile(target_id);
+      if (!profile) {
+        return res.status(404).json({ error: '未找到该目标的轨迹数据' });
+      }
+      res.json(profile);
+    } catch (err) {
+      console.error('[API] 刷新目标行为画像失败:', err.message);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.get('/api/behavior-profiles/compare/:target_id1/:target_id2', async (req, res) => {
+    try {
+      const { target_id1, target_id2 } = req.params;
+      const result = await behaviorEngine.compareProfiles(target_id1, target_id2);
+      if (!result) {
+        return res.status(404).json({ error: '未找到目标画像，无法对比' });
+      }
+      res.json(result);
+    } catch (err) {
+      console.error('[API] 画像对比失败:', err.message);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.get('/api/behavior-anomalies', async (req, res) => {
+    try {
+      const { target_id, anomaly_type, start_time, end_time, group_id, limit, offset } = req.query;
+      const anomalies = await BehaviorAnomalyModel.query({
+        target_id,
+        anomaly_type,
+        start_time: start_time ? parseInt(start_time) : undefined,
+        end_time: end_time ? parseInt(end_time) : undefined,
+        group_id: group_id !== undefined && group_id !== '' ? parseInt(group_id) : undefined,
+        limit: limit ? parseInt(limit) : 100,
+        offset: offset ? parseInt(offset) : 0
+      });
+      res.json({ count: anomalies.length, anomalies });
+    } catch (err) {
+      console.error('[API] 查询异常事件失败:', err.message);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.get('/api/behavior-anomalies/:id', async (req, res) => {
+    try {
+      const { id } = req.params;
+      const anomaly = await BehaviorAnomalyModel.getById(parseInt(id));
+      if (!anomaly) {
+        return res.status(404).json({ error: '异常事件不存在' });
+      }
+      res.json(anomaly);
+    } catch (err) {
+      console.error('[API] 获取异常事件详情失败:', err.message);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.get('/api/behavior-anomaly-stats/targets', async (req, res) => {
+    try {
+      const { start_time, end_time } = req.query;
+      const stats = await BehaviorAnomalyModel.getTargetStats(
+        start_time ? parseInt(start_time) : undefined,
+        end_time ? parseInt(end_time) : undefined
+      );
+      res.json(stats);
+    } catch (err) {
+      console.error('[API] 获取目标异常统计失败:', err.message);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.get('/api/behavior-anomaly-stats/types', async (req, res) => {
+    try {
+      const { start_time, end_time } = req.query;
+      const stats = await BehaviorAnomalyModel.getTypeDistribution(
+        start_time ? parseInt(start_time) : undefined,
+        end_time ? parseInt(end_time) : undefined
+      );
+      res.json(stats);
+    } catch (err) {
+      console.error('[API] 获取异常类型分布失败:', err.message);
       res.status(500).json({ error: err.message });
     }
   });
@@ -1134,6 +1288,20 @@ async function main() {
       console.error('[Data] 生成历史轨迹数据失败:', err.message);
     }
 
+    console.log('[Behavior] 正在构建初始行为画像...');
+    try {
+      await behaviorEngine.updateAllProfiles();
+    } catch (err) {
+      console.error('[Behavior] 初始画像构建失败:', err.message);
+    }
+
+    console.log('[Behavior] 正在预置异常事件...');
+    try {
+      await behaviorEngine.initPresetAnomalies();
+    } catch (err) {
+      console.error('[Behavior] 预置异常事件失败:', err.message);
+    }
+
     gpsSimulator.start();
     console.log('[GPS] 模拟器已启动，5个目标正在移动');
 
@@ -1143,6 +1311,8 @@ async function main() {
     workOrderEngine.startEscalationScanner(30000);
     patrolEngine.startScheduler(1000);
     console.log('[Patrol] 巡检任务调度器已启动');
+
+    behaviorEngine.startHourlyUpdate();
   });
 
   process.on('SIGINT', () => {
@@ -1152,6 +1322,7 @@ async function main() {
     replayManager.stopReplay();
     if (workOrderEngine) workOrderEngine.stopEscalationScanner();
     if (patrolEngine) patrolEngine.stopScheduler();
+    if (behaviorEngine) behaviorEngine.stopHourlyUpdate();
     server.close(() => {
       console.log('[Server] 已关闭');
       process.exit(0);
