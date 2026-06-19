@@ -62,7 +62,7 @@ const presetBindings = [
 const weekdayTimeSlots = [{ weekdays: [1, 2, 3, 4, 5], start_time: '08:00', end_time: '18:00' }];
 const allDayTimeSlots = [{ weekdays: [0, 1, 2, 3, 4, 5, 6], start_time: '00:00', end_time: '23:59' }];
 
-async function initPresetData(FenceModel, POIModel, TargetGroupModel, TargetBindingModel, FenceTimeWindowModel, FenceAlertRuleModel, FenceActionModel, DutyScheduleModel, WorkOrderModel, WorkOrderEscalationModel, AlertModel) {
+async function initPresetData(FenceModel, POIModel, TargetGroupModel, TargetBindingModel, FenceTimeWindowModel, FenceAlertRuleModel, FenceActionModel, DutyScheduleModel, WorkOrderModel, WorkOrderEscalationModel, AlertModel, PatrolTaskModel) {
   const existingFences = await FenceModel.getAll();
   let fenceMap = new Map();
   if (existingFences.length === 0) {
@@ -334,6 +334,86 @@ async function initPresetData(FenceModel, POIModel, TargetGroupModel, TargetBind
       });
 
       console.log('[Preset] 已创建3个示例工单（2已关闭+1待处理）');
+    }
+  }
+
+  if (PatrolTaskModel) {
+    const existingPatrolTasks = await PatrolTaskModel.count();
+    if (existingPatrolTasks === 0) {
+      const forbiddenEnterFence = fenceMap.get('禁入区-军事管理区');
+      const normalFence = fenceMap.get('普通区-监控区域');
+      const forbiddenLeaveFence = fenceMap.get('禁出区-安全保护区');
+
+      if (forbiddenEnterFence && normalFence && forbiddenLeaveFence) {
+        function calculateCentroid(vertices) {
+          let lngSum = 0;
+          let latSum = 0;
+          for (const v of vertices) {
+            lngSum += v.lng;
+            latSum += v.lat;
+          }
+          return {
+            lng: lngSum / vertices.length,
+            lat: latSum / vertices.length
+          };
+        }
+
+        const forbiddenEnterCentroid = calculateCentroid(forbiddenEnterFence.vertices);
+        const normalCentroid = calculateCentroid(normalFence.vertices);
+        const forbiddenLeaveCentroid = calculateCentroid(forbiddenLeaveFence.vertices);
+
+        const now = Date.now();
+        const twoHoursAgo = now - 2 * 60 * 60 * 1000;
+        const oneAndHalfHoursAgo = now - 1.5 * 60 * 60 * 1000;
+
+        const historicalWaypoints = [
+          { fence_id: forbiddenEnterFence.id, fence_name: forbiddenEnterFence.name, centroid_lng: forbiddenEnterCentroid.lng, centroid_lat: forbiddenEnterCentroid.lat },
+          { fence_id: normalFence.id, fence_name: normalFence.name, centroid_lng: normalCentroid.lng, centroid_lat: normalCentroid.lat },
+          { fence_id: forbiddenLeaveFence.id, fence_name: forbiddenLeaveFence.name, centroid_lng: forbiddenLeaveCentroid.lng, centroid_lat: forbiddenLeaveCentroid.lat }
+        ];
+
+        const historicalTask = await PatrolTaskModel.create({
+          task_name: '历史巡检任务-东区常规巡逻',
+          target_id: 'T002',
+          target_name: '车辆B-002',
+          frequency: 'once',
+          planned_start_time: twoHoursAgo,
+          deadline_time: twoHoursAgo + 60 * 60 * 1000,
+          waypoints: historicalWaypoints
+        });
+
+        await PatrolTaskModel.update(historicalTask.id, {
+          status: 'completed',
+          actual_start_time: twoHoursAgo + 5 * 60 * 1000,
+          completed_time: oneAndHalfHoursAgo,
+          current_waypoint_index: 3
+        });
+
+        for (let i = 0; i < historicalWaypoints.length; i++) {
+          const arrivedAt = twoHoursAgo + 5 * 60 * 1000 + i * 20 * 60 * 1000;
+          await PatrolTaskModel.markWaypointArrived(historicalTask.id, i, arrivedAt);
+        }
+
+        console.log('[Preset] 已创建1个历史巡检任务（已完成）');
+
+        const pendingWaypoints = [
+          { fence_id: forbiddenEnterFence.id, fence_name: forbiddenEnterFence.name, centroid_lng: forbiddenEnterCentroid.lng, centroid_lat: forbiddenEnterCentroid.lat },
+          { fence_id: normalFence.id, fence_name: normalFence.name, centroid_lng: normalCentroid.lng, centroid_lat: normalCentroid.lat },
+          { fence_id: forbiddenLeaveFence.id, fence_name: forbiddenLeaveFence.name, centroid_lng: forbiddenLeaveCentroid.lng, centroid_lat: forbiddenLeaveCentroid.lat }
+        ];
+
+        await PatrolTaskModel.create({
+          task_name: '常规巡检-禁入区→普通区→禁出区',
+          target_id: 'T001',
+          target_name: '车辆A-001',
+          frequency: 'once',
+          planned_start_time: now + 60 * 1000,
+          deadline_time: now + 30 * 60 * 1000,
+          waypoints: pendingWaypoints
+        });
+
+        console.log('[Preset] 已创建1个待激活巡检任务（60秒后激活，T001按顺序巡禁入区、普通区、禁出区）');
+      }
     }
   }
 }

@@ -226,6 +226,45 @@ db.serialize(() => {
     )
   `);
   db.run(`CREATE INDEX IF NOT EXISTS idx_escalation_wo ON work_order_escalations(work_order_id)`);
+
+  db.run(`
+    CREATE TABLE IF NOT EXISTS patrol_tasks (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      task_name TEXT NOT NULL,
+      target_id TEXT NOT NULL,
+      target_name TEXT,
+      frequency TEXT NOT NULL CHECK(frequency IN ('once', 'daily', 'weekly')) DEFAULT 'once',
+      planned_start_time INTEGER NOT NULL,
+      deadline_time INTEGER NOT NULL,
+      status TEXT NOT NULL CHECK(status IN ('pending', 'active', 'completed', 'overdue', 'cancelled')) DEFAULT 'pending',
+      actual_start_time INTEGER,
+      completed_time INTEGER,
+      current_waypoint_index INTEGER NOT NULL DEFAULT 0,
+      parent_task_id INTEGER,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      FOREIGN KEY (parent_task_id) REFERENCES patrol_tasks(id) ON DELETE SET NULL
+    )
+  `);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_patrol_status ON patrol_tasks(status)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_patrol_target ON patrol_tasks(target_id)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_patrol_start ON patrol_tasks(planned_start_time)`);
+
+  db.run(`
+    CREATE TABLE IF NOT EXISTS patrol_waypoints (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      task_id INTEGER NOT NULL,
+      fence_id INTEGER NOT NULL,
+      fence_name TEXT NOT NULL,
+      sequence_index INTEGER NOT NULL,
+      centroid_lng REAL NOT NULL,
+      centroid_lat REAL NOT NULL,
+      arrived_at INTEGER,
+      FOREIGN KEY (task_id) REFERENCES patrol_tasks(id) ON DELETE CASCADE
+    )
+  `);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_patrol_wp_task ON patrol_waypoints(task_id)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_patrol_wp_fence ON patrol_waypoints(fence_id)`);
 });
 
 function run(sql, params = []) {
@@ -983,6 +1022,192 @@ const WorkOrderModel = {
   }
 };
 
+const PatrolTaskModel = {
+  async create({ task_name, target_id, target_name, frequency, planned_start_time, deadline_time, waypoints, parent_task_id }) {
+    const now = Date.now();
+    const result = await run(
+      `INSERT INTO patrol_tasks (
+        task_name, target_id, target_name, frequency, planned_start_time, deadline_time,
+        status, current_waypoint_index, parent_task_id, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?)`,
+      [task_name, target_id, target_name || null, frequency || 'once', planned_start_time, deadline_time,
+       parent_task_id || null, now, now]
+    );
+    const taskId = result.lastID;
+    
+    if (waypoints && waypoints.length > 0) {
+      for (let i = 0; i < waypoints.length; i++) {
+        const wp = waypoints[i];
+        await run(
+          `INSERT INTO patrol_waypoints (task_id, fence_id, fence_name, sequence_index, centroid_lng, centroid_lat)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+          [taskId, wp.fence_id, wp.fence_name, i, wp.centroid_lng, wp.centroid_lat]
+        );
+      }
+    }
+    
+    return this.getById(taskId);
+  },
+  
+  async getById(id) {
+    const row = await get('SELECT * FROM patrol_tasks WHERE id = ?', [id]);
+    if (!row) return null;
+    const waypoints = await all(
+      'SELECT * FROM patrol_waypoints WHERE task_id = ? ORDER BY sequence_index ASC',
+      [id]
+    );
+    return { ...row, waypoints };
+  },
+  
+  async update(id, fields) {
+    const existing = await this.getById(id);
+    if (!existing) return null;
+    const keys = Object.keys(fields);
+    if (keys.length === 0) return existing;
+    const setClause = keys.map(k => `${k} = ?`).join(', ');
+    const values = keys.map(k => fields[k]);
+    values.push(Date.now());
+    values.push(id);
+    await run(`UPDATE patrol_tasks SET ${setClause}, updated_at = ? WHERE id = ?`, values);
+    return this.getById(id);
+  },
+  
+  async query({ target_id, status, start_time, end_time, limit = 100, offset = 0 } = {}) {
+    let sql = 'SELECT * FROM patrol_tasks WHERE 1=1';
+    const params = [];
+    if (target_id) { sql += ' AND target_id = ?'; params.push(target_id); }
+    if (status) { sql += ' AND status = ?'; params.push(status); }
+    if (start_time) { sql += ' AND planned_start_time >= ?'; params.push(start_time); }
+    if (end_time) { sql += ' AND planned_start_time <= ?'; params.push(end_time); }
+    sql += ' ORDER BY planned_start_time DESC LIMIT ? OFFSET ?';
+    params.push(limit, offset);
+    const rows = await all(sql, params);
+    const tasks = [];
+    for (const row of rows) {
+      const waypoints = await all(
+        'SELECT * FROM patrol_waypoints WHERE task_id = ? ORDER BY sequence_index ASC',
+        [row.id]
+      );
+      tasks.push({ ...row, waypoints });
+    }
+    return tasks;
+  },
+  
+  async getPendingToActivate(now = Date.now()) {
+    const rows = await all(
+      `SELECT * FROM patrol_tasks 
+       WHERE status = 'pending' AND planned_start_time <= ?
+       ORDER BY planned_start_time ASC`,
+      [now]
+    );
+    const tasks = [];
+    for (const row of rows) {
+      const waypoints = await all(
+        'SELECT * FROM patrol_waypoints WHERE task_id = ? ORDER BY sequence_index ASC',
+        [row.id]
+      );
+      tasks.push({ ...row, waypoints });
+    }
+    return tasks;
+  },
+  
+  async getActiveTasks() {
+    const rows = await all(
+      `SELECT * FROM patrol_tasks WHERE status = 'active' ORDER BY actual_start_time ASC`
+    );
+    const tasks = [];
+    for (const row of rows) {
+      const waypoints = await all(
+        'SELECT * FROM patrol_waypoints WHERE task_id = ? ORDER BY sequence_index ASC',
+        [row.id]
+      );
+      tasks.push({ ...row, waypoints });
+    }
+    return tasks;
+  },
+  
+  async getOverdueTasks(now = Date.now()) {
+    const rows = await all(
+      `SELECT * FROM patrol_tasks 
+       WHERE status = 'active' AND deadline_time <= ?
+       ORDER BY deadline_time ASC`,
+      [now]
+    );
+    const tasks = [];
+    for (const row of rows) {
+      const waypoints = await all(
+        'SELECT * FROM patrol_waypoints WHERE task_id = ? ORDER BY sequence_index ASC',
+        [row.id]
+      );
+      tasks.push({ ...row, waypoints });
+    }
+    return tasks;
+  },
+  
+  async markWaypointArrived(taskId, waypointIndex, arrivedAt = Date.now()) {
+    await run(
+      `UPDATE patrol_waypoints SET arrived_at = ? 
+       WHERE task_id = ? AND sequence_index = ?`,
+      [arrivedAt, taskId, waypointIndex]
+    );
+  },
+  
+  async getTargetStats(startTime, endTime) {
+    let sql = `
+      SELECT 
+        target_id,
+        target_name,
+        COUNT(*) as total_tasks,
+        SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed_tasks,
+        SUM(CASE WHEN status = 'overdue' THEN 1 ELSE 0 END) as overdue_tasks,
+        AVG(CASE WHEN status = 'completed' AND completed_time IS NOT NULL AND actual_start_time IS NOT NULL 
+                 THEN completed_time - actual_start_time ELSE NULL END) as avg_duration_ms
+      FROM patrol_tasks
+      WHERE status IN ('completed', 'overdue')
+    `;
+    const params = [];
+    if (startTime) { sql += ' AND created_at >= ?'; params.push(startTime); }
+    if (endTime) { sql += ' AND created_at <= ?'; params.push(endTime); }
+    sql += ' GROUP BY target_id, target_name';
+    
+    const rows = await all(sql, params);
+    return rows.map(row => ({
+      target_id: row.target_id,
+      target_name: row.target_name,
+      total_tasks: row.total_tasks,
+      completed_tasks: row.completed_tasks,
+      overdue_tasks: row.overdue_tasks,
+      completion_rate: row.total_tasks > 0 ? row.completed_tasks / row.total_tasks : 0,
+      overdue_rate: row.total_tasks > 0 ? row.overdue_tasks / row.total_tasks : 0,
+      avg_duration_seconds: row.avg_duration_ms ? Math.round(row.avg_duration_ms / 1000) : 0
+    }));
+  },
+  
+  async getFenceCoverageStats(startTime, endTime) {
+    let sql = `
+      SELECT 
+        pw.fence_id,
+        pw.fence_name,
+        COUNT(DISTINCT pt.id) as task_count,
+        SUM(CASE WHEN pw.arrived_at IS NOT NULL THEN 1 ELSE 0 END) as visited_count
+      FROM patrol_waypoints pw
+      INNER JOIN patrol_tasks pt ON pw.task_id = pt.id
+      WHERE pt.status IN ('completed', 'overdue', 'active')
+    `;
+    const params = [];
+    if (startTime) { sql += ' AND pt.created_at >= ?'; params.push(startTime); }
+    if (endTime) { sql += ' AND pt.created_at <= ?'; params.push(endTime); }
+    sql += ' GROUP BY pw.fence_id, pw.fence_name ORDER BY task_count DESC';
+    
+    return all(sql, params);
+  },
+  
+  async count() {
+    const row = await get('SELECT COUNT(*) as count FROM patrol_tasks');
+    return row ? row.count : 0;
+  }
+};
+
 module.exports = {
   db,
   FenceModel,
@@ -998,5 +1223,6 @@ module.exports = {
   HeatmapModel,
   DutyScheduleModel,
   WorkOrderModel,
-  WorkOrderEscalationModel
+  WorkOrderEscalationModel,
+  PatrolTaskModel
 };

@@ -17,7 +17,8 @@ const {
   HeatmapModel,
   DutyScheduleModel,
   WorkOrderModel,
-  WorkOrderEscalationModel
+  WorkOrderEscalationModel,
+  PatrolTaskModel
 } = require('./database');
 const { FenceEngine } = require('./fenceEngine');
 const { WorkOrderEngine } = require('./workOrderEngine');
@@ -26,6 +27,7 @@ const { isPolygonSelfIntersecting } = require('./geometry');
 const { initPresetData } = require('./presetData');
 const { HeatmapManager } = require('./heatmapManager');
 const { ReplayManager } = require('./replayManager');
+const { PatrolEngine } = require('./patrolEngine');
 
 const app = express();
 const server = http.createServer(app);
@@ -55,9 +57,10 @@ let gpsSimulator;
 let heatmapManager;
 let replayManager;
 let workOrderEngine;
+let patrolEngine;
 
 async function main() {
-  await initPresetData(FenceModel, POIModel, TargetGroupModel, TargetBindingModel, FenceTimeWindowModel, FenceAlertRuleModel, FenceActionModel, DutyScheduleModel, WorkOrderModel, WorkOrderEscalationModel, AlertModel);
+  await initPresetData(FenceModel, POIModel, TargetGroupModel, TargetBindingModel, FenceTimeWindowModel, FenceAlertRuleModel, FenceActionModel, DutyScheduleModel, WorkOrderModel, WorkOrderEscalationModel, AlertModel, PatrolTaskModel);
 
   workOrderEngine = new WorkOrderEngine((update) => {
     broadcast({
@@ -65,6 +68,14 @@ async function main() {
       data: update
     });
   });
+
+  patrolEngine = new PatrolEngine((update) => {
+    broadcast({
+      type: 'patrol_update',
+      data: update
+    });
+  });
+  await patrolEngine.init();
 
   fenceEngine = new FenceEngine(
     (alert) => {
@@ -94,6 +105,7 @@ async function main() {
   gpsSimulator = new GPSSimulator(async (position) => {
     if (!replayManager.isTargetInReplay(position.id)) {
       fenceEngine.processPositionUpdate(position);
+      patrolEngine.processPositionUpdate(position);
       const binding = await TargetBindingModel.getBinding(position.id);
       const posWithGroup = {
         ...position,
@@ -501,16 +513,21 @@ async function main() {
     const targets = gpsSimulator.getAllTargets();
     const pendingOrders = await WorkOrderModel.query({ status: 'pending', limit: 1 });
     const escalatedOrders = await WorkOrderModel.query({ status: 'escalated', limit: 1 });
+    const patrolTasks = await PatrolTaskModel.count();
+    const activePatrolTasks = patrolEngine ? patrolEngine.getAllActiveProgress().length : 0;
     res.json({
       online_targets: targets.length,
       total_alerts: await AlertModel.getTodayCount(),
       total_work_orders: await WorkOrderModel.count(),
       pending_work_orders: pendingOrders.length,
       escalated_work_orders: escalatedOrders.length,
+      total_patrol_tasks: patrolTasks,
+      active_patrol_tasks: activePatrolTasks,
       ws_connections: clients.size,
       simulator_running: gpsSimulator.isRunning,
       replay_active: replayManager.isReplaying(),
-      escalation_scanner_running: workOrderEngine ? workOrderEngine.escalationTimer !== null : false
+      escalation_scanner_running: workOrderEngine ? workOrderEngine.escalationTimer !== null : false,
+      patrol_scheduler_running: patrolEngine ? patrolEngine.isRunning : false
     });
   });
 
@@ -950,6 +967,160 @@ async function main() {
     }
   });
 
+  app.get('/api/patrol-tasks', async (req, res) => {
+    try {
+      const { target_id, status, start_time, end_time, limit, offset } = req.query;
+      const tasks = await PatrolTaskModel.query({
+        target_id,
+        status,
+        start_time: start_time ? parseInt(start_time) : undefined,
+        end_time: end_time ? parseInt(end_time) : undefined,
+        limit: limit ? parseInt(limit) : 100,
+        offset: offset ? parseInt(offset) : 0
+      });
+      res.json(tasks);
+    } catch (err) {
+      console.error('[API] 查询巡检任务失败:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.get('/api/patrol-tasks/active/progress', async (req, res) => {
+    try {
+      const progressList = patrolEngine.getAllActiveProgress();
+      res.json({ count: progressList.length, items: progressList });
+    } catch (err) {
+      console.error('[API] 获取进行中任务进度失败:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.get('/api/patrol-tasks/:id', async (req, res) => {
+    try {
+      const { id } = req.params;
+      const task = await PatrolTaskModel.getById(parseInt(id));
+      if (!task) {
+        return res.status(404).json({ error: '任务不存在' });
+      }
+      res.json(task);
+    } catch (err) {
+      console.error('[API] 获取巡检任务失败:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.post('/api/patrol-tasks', async (req, res) => {
+    try {
+      const { task_name, target_id, target_name, frequency, planned_start_time, deadline_time, fence_ids } = req.body;
+      
+      if (!task_name || !target_id || !planned_start_time || !deadline_time || !fence_ids) {
+        return res.status(400).json({ error: '参数不完整，需要 task_name、target_id、planned_start_time、deadline_time、fence_ids' });
+      }
+      
+      if (!Array.isArray(fence_ids) || fence_ids.length === 0) {
+        return res.status(400).json({ error: 'fence_ids 必须是非空数组' });
+      }
+      
+      if (frequency && !['once', 'daily', 'weekly'].includes(frequency)) {
+        return res.status(400).json({ error: 'frequency 只能是 once、daily、weekly' });
+      }
+      
+      const task = await patrolEngine.createTask({
+        task_name,
+        target_id,
+        target_name,
+        frequency: frequency || 'once',
+        planned_start_time: parseInt(planned_start_time),
+        deadline_time: parseInt(deadline_time),
+        fence_ids: fence_ids.map(Number)
+      });
+      
+      res.status(201).json(task);
+    } catch (err) {
+      console.error('[API] 创建巡检任务失败:', err);
+      res.status(400).json({ error: err.message });
+    }
+  });
+
+  app.post('/api/patrol-tasks/:id/cancel', async (req, res) => {
+    try {
+      const { id } = req.params;
+      const task = await patrolEngine.cancelTask(parseInt(id));
+      res.json(task);
+    } catch (err) {
+      console.error('[API] 取消巡检任务失败:', err);
+      res.status(400).json({ error: err.message });
+    }
+  });
+
+  app.get('/api/patrol-tasks/:id/progress', async (req, res) => {
+    try {
+      const { id } = req.params;
+      const progress = patrolEngine.getTaskProgress(parseInt(id));
+      if (!progress) {
+        const task = await PatrolTaskModel.getById(parseInt(id));
+        if (!task) {
+          return res.status(404).json({ error: '任务不存在' });
+        }
+        const totalWaypoints = task.waypoints.length;
+        const arrivedCount = task.waypoints.filter(w => w.arrived_at).length;
+        res.json({
+          task_id: task.id,
+          task_name: task.task_name,
+          status: task.status,
+          target_id: task.target_id,
+          target_name: task.target_name,
+          current_waypoint_index: task.current_waypoint_index,
+          current_waypoint: task.current_waypoint_index < totalWaypoints ? task.waypoints[task.current_waypoint_index] : null,
+          next_waypoint: task.current_waypoint_index + 1 < totalWaypoints ? task.waypoints[task.current_waypoint_index + 1] : null,
+          arrived_count: arrivedCount,
+          total_waypoints: totalWaypoints,
+          progress_percent: totalWaypoints > 0 ? Math.round((arrivedCount / totalWaypoints) * 1000) / 10 : 0,
+          elapsed_seconds: task.actual_start_time ? Math.round((Date.now() - task.actual_start_time) / 1000) : 0,
+          remaining_seconds: Math.max(0, Math.round((task.deadline_time - Date.now()) / 1000)),
+          planned_start_time: task.planned_start_time,
+          deadline_time: task.deadline_time,
+          actual_start_time: task.actual_start_time,
+          completed_time: task.completed_time,
+          waypoints: task.waypoints
+        });
+        return;
+      }
+      res.json(progress);
+    } catch (err) {
+      console.error('[API] 获取任务进度失败:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.get('/api/patrol-stats/targets', async (req, res) => {
+    try {
+      const { start_time, end_time } = req.query;
+      const stats = await PatrolTaskModel.getTargetStats(
+        start_time ? parseInt(start_time) : undefined,
+        end_time ? parseInt(end_time) : undefined
+      );
+      res.json(stats);
+    } catch (err) {
+      console.error('[API] 获取目标巡检统计失败:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.get('/api/patrol-stats/fence-coverage', async (req, res) => {
+    try {
+      const { start_time, end_time } = req.query;
+      const stats = await PatrolTaskModel.getFenceCoverageStats(
+        start_time ? parseInt(start_time) : undefined,
+        end_time ? parseInt(end_time) : undefined
+      );
+      res.json(stats);
+    } catch (err) {
+      console.error('[API] 获取围栏覆盖统计失败:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   const PORT = process.env.PORT || 3000;
 
   server.listen(PORT, async () => {
@@ -970,6 +1141,8 @@ async function main() {
     console.log('[Heatmap] 热力聚合器已启动');
 
     workOrderEngine.startEscalationScanner(30000);
+    patrolEngine.startScheduler(1000);
+    console.log('[Patrol] 巡检任务调度器已启动');
   });
 
   process.on('SIGINT', () => {
@@ -978,6 +1151,7 @@ async function main() {
     heatmapManager.stop();
     replayManager.stopReplay();
     if (workOrderEngine) workOrderEngine.stopEscalationScanner();
+    if (patrolEngine) patrolEngine.stopScheduler();
     server.close(() => {
       console.log('[Server] 已关闭');
       process.exit(0);
