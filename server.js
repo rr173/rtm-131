@@ -14,9 +14,13 @@ const {
   FenceActionModel,
   FenceActivationOverrideModel,
   TrajectoryModel,
-  HeatmapModel
+  HeatmapModel,
+  DutyScheduleModel,
+  WorkOrderModel,
+  WorkOrderEscalationModel
 } = require('./database');
 const { FenceEngine } = require('./fenceEngine');
+const { WorkOrderEngine } = require('./workOrderEngine');
 const { GPSSimulator } = require('./gpsSimulator');
 const { isPolygonSelfIntersecting } = require('./geometry');
 const { initPresetData } = require('./presetData');
@@ -50,9 +54,17 @@ let fenceEngine;
 let gpsSimulator;
 let heatmapManager;
 let replayManager;
+let workOrderEngine;
 
 async function main() {
-  await initPresetData(FenceModel, POIModel, TargetGroupModel, TargetBindingModel, FenceTimeWindowModel, FenceAlertRuleModel, FenceActionModel);
+  await initPresetData(FenceModel, POIModel, TargetGroupModel, TargetBindingModel, FenceTimeWindowModel, FenceAlertRuleModel, FenceActionModel, DutyScheduleModel, WorkOrderModel, WorkOrderEscalationModel, AlertModel);
+
+  workOrderEngine = new WorkOrderEngine((update) => {
+    broadcast({
+      type: 'work_order_update',
+      data: update
+    });
+  });
 
   fenceEngine = new FenceEngine(
     (alert) => {
@@ -60,6 +72,11 @@ async function main() {
     },
     (status) => {
       broadcast({ type: 'fence_status', data: status });
+    },
+    (alert) => {
+      workOrderEngine.createWorkOrderFromAlert(alert).catch(err => {
+        console.error('[Server] 创建工单失败:', err.message);
+      });
     }
   );
   await fenceEngine.reloadFences();
@@ -482,12 +499,18 @@ async function main() {
 
   app.get('/api/status', async (req, res) => {
     const targets = gpsSimulator.getAllTargets();
+    const pendingOrders = await WorkOrderModel.query({ status: 'pending', limit: 1 });
+    const escalatedOrders = await WorkOrderModel.query({ status: 'escalated', limit: 1 });
     res.json({
       online_targets: targets.length,
       total_alerts: await AlertModel.getTodayCount(),
+      total_work_orders: await WorkOrderModel.count(),
+      pending_work_orders: pendingOrders.length,
+      escalated_work_orders: escalatedOrders.length,
       ws_connections: clients.size,
       simulator_running: gpsSimulator.isRunning,
-      replay_active: replayManager.isReplaying()
+      replay_active: replayManager.isReplaying(),
+      escalation_scanner_running: workOrderEngine ? workOrderEngine.escalationTimer !== null : false
     });
   });
 
@@ -718,6 +741,215 @@ async function main() {
     }
   });
 
+  app.get('/api/duty-schedules', async (req, res) => {
+    try {
+      const schedules = await DutyScheduleModel.getAll();
+      res.json(schedules);
+    } catch (err) {
+      console.error('[API] 查询排班失败:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.get('/api/duty-schedules/:id', async (req, res) => {
+    try {
+      const { id } = req.params;
+      const schedule = await DutyScheduleModel.getById(parseInt(id));
+      if (!schedule) return res.status(404).json({ error: '排班记录不存在' });
+      res.json(schedule);
+    } catch (err) {
+      console.error('[API] 查询排班失败:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.get('/api/duty-schedules/fence/:fence_id/current', async (req, res) => {
+    try {
+      const { fence_id } = req.params;
+      const fenceId = parseInt(fence_id);
+      const fence = await FenceModel.getById(fenceId);
+      if (!fence) return res.status(404).json({ error: '围栏不存在' });
+      const schedules = await DutyScheduleModel.getByFenceIdsAndTime([fenceId]);
+      res.json({
+        fence_id: fenceId,
+        fence_name: fence.name,
+        query_time: new Date().toISOString(),
+        on_duty_officers: schedules
+      });
+    } catch (err) {
+      console.error('[API] 查询当前值班人失败:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.post('/api/duty-schedules', async (req, res) => {
+    try {
+      const { officer_name, contact, fence_ids, time_slots, priority } = req.body;
+      if (!officer_name || !contact) {
+        return res.status(400).json({ error: '值班人姓名和联系方式是必填项' });
+      }
+      if (!Array.isArray(fence_ids) || fence_ids.length === 0) {
+        return res.status(400).json({ error: '必须指定至少一个负责的围栏' });
+      }
+      if (!Array.isArray(time_slots) || time_slots.length === 0) {
+        return res.status(400).json({ error: '必须指定至少一个生效时段' });
+      }
+      for (const slot of time_slots) {
+        if (!Array.isArray(slot.weekdays) || !slot.start_time || !slot.end_time) {
+          return res.status(400).json({ error: '时段格式错误，需要 weekdays + start_time + end_time' });
+        }
+      }
+      const schedule = await DutyScheduleModel.create({
+        officer_name, contact, fence_ids, time_slots,
+        priority: priority !== undefined ? parseInt(priority) : 1
+      });
+      res.status(201).json(schedule);
+    } catch (err) {
+      console.error('[API] 创建排班失败:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.put('/api/duty-schedules/:id', async (req, res) => {
+    try {
+      const { id } = req.params;
+      const { officer_name, contact, fence_ids, time_slots, priority } = req.body;
+      const existing = await DutyScheduleModel.getById(parseInt(id));
+      if (!existing) return res.status(404).json({ error: '排班记录不存在' });
+      if (time_slots !== undefined) {
+        if (!Array.isArray(time_slots) || time_slots.length === 0) {
+          return res.status(400).json({ error: '必须指定至少一个生效时段' });
+        }
+        for (const slot of time_slots) {
+          if (!Array.isArray(slot.weekdays) || !slot.start_time || !slot.end_time) {
+            return res.status(400).json({ error: '时段格式错误' });
+          }
+        }
+      }
+      if (fence_ids !== undefined && (!Array.isArray(fence_ids) || fence_ids.length === 0)) {
+        return res.status(400).json({ error: '必须指定至少一个负责的围栏' });
+      }
+      const schedule = await DutyScheduleModel.update(parseInt(id), {
+        officer_name, contact, fence_ids, time_slots,
+        priority: priority !== undefined ? parseInt(priority) : undefined
+      });
+      res.json(schedule);
+    } catch (err) {
+      console.error('[API] 更新排班失败:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.delete('/api/duty-schedules/:id', async (req, res) => {
+    try {
+      const { id } = req.params;
+      const existing = await DutyScheduleModel.getById(parseInt(id));
+      if (!existing) return res.status(404).json({ error: '排班记录不存在' });
+      await DutyScheduleModel.delete(parseInt(id));
+      res.json({ success: true });
+    } catch (err) {
+      console.error('[API] 删除排班失败:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.get('/api/work-orders', async (req, res) => {
+    try {
+      const { officer, fence_id, status, start_time, end_time, limit, offset } = req.query;
+      const orders = await WorkOrderModel.query({
+        officer,
+        fence_id: fence_id !== undefined ? parseInt(fence_id) : undefined,
+        status,
+        start_time: start_time ? parseInt(start_time) : undefined,
+        end_time: end_time ? parseInt(end_time) : undefined,
+        limit: limit ? parseInt(limit) : 100,
+        offset: offset ? parseInt(offset) : 0
+      });
+      res.json(orders);
+    } catch (err) {
+      console.error('[API] 查询工单失败:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.get('/api/work-orders/:id', async (req, res) => {
+    try {
+      const { id } = req.params;
+      const order = await WorkOrderModel.getById(parseInt(id));
+      if (!order) return res.status(404).json({ error: '工单不存在' });
+      res.json(order);
+    } catch (err) {
+      console.error('[API] 查询工单失败:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.get('/api/work-orders/:id/lifecycle', async (req, res) => {
+    try {
+      const { id } = req.params;
+      const lifecycle = await workOrderEngine.getWorkOrderLifecycle(parseInt(id));
+      if (!lifecycle) return res.status(404).json({ error: '工单不存在' });
+      res.json(lifecycle);
+    } catch (err) {
+      console.error('[API] 查询工单生命周期失败:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.post('/api/work-orders/:id/claim', async (req, res) => {
+    try {
+      const { id } = req.params;
+      const { officer_name } = req.body;
+      if (!officer_name) return res.status(400).json({ error: '必须提供值班人姓名 officer_name' });
+      const updated = await workOrderEngine.claimWorkOrder(parseInt(id), officer_name);
+      res.json(updated);
+    } catch (err) {
+      console.error('[API] 认领工单失败:', err);
+      res.status(400).json({ error: err.message });
+    }
+  });
+
+  app.post('/api/work-orders/:id/process', async (req, res) => {
+    try {
+      const { id } = req.params;
+      const { officer_name } = req.body;
+      if (!officer_name) return res.status(400).json({ error: '必须提供值班人姓名 officer_name' });
+      const updated = await workOrderEngine.startProcessing(parseInt(id), officer_name);
+      res.json(updated);
+    } catch (err) {
+      console.error('[API] 处理工单失败:', err);
+      res.status(400).json({ error: err.message });
+    }
+  });
+
+  app.post('/api/work-orders/:id/resolve', async (req, res) => {
+    try {
+      const { id } = req.params;
+      const { officer_name, resolution_note } = req.body;
+      if (!officer_name) return res.status(400).json({ error: '必须提供值班人姓名 officer_name' });
+      if (!resolution_note) return res.status(400).json({ error: '必须填写处理备注 resolution_note' });
+      const updated = await workOrderEngine.resolveWorkOrder(parseInt(id), officer_name, resolution_note);
+      res.json(updated);
+    } catch (err) {
+      console.error('[API] 关闭工单失败:', err);
+      res.status(400).json({ error: err.message });
+    }
+  });
+
+  app.get('/api/work-orders-stats/officers', async (req, res) => {
+    try {
+      const { start_time, end_time } = req.query;
+      const stats = await WorkOrderModel.getOfficerStats(
+        start_time ? parseInt(start_time) : undefined,
+        end_time ? parseInt(end_time) : undefined
+      );
+      res.json(stats);
+    } catch (err) {
+      console.error('[API] 值班人统计失败:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   const PORT = process.env.PORT || 3000;
 
   server.listen(PORT, async () => {
@@ -736,6 +968,8 @@ async function main() {
 
     heatmapManager.start();
     console.log('[Heatmap] 热力聚合器已启动');
+
+    workOrderEngine.startEscalationScanner(30000);
   });
 
   process.on('SIGINT', () => {
@@ -743,6 +977,7 @@ async function main() {
     gpsSimulator.stop();
     heatmapManager.stop();
     replayManager.stopReplay();
+    if (workOrderEngine) workOrderEngine.stopEscalationScanner();
     server.close(() => {
       console.log('[Server] 已关闭');
       process.exit(0);

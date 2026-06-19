@@ -59,7 +59,10 @@ const presetBindings = [
   { target_id: 'T005', group_name: '巡逻车辆' }
 ];
 
-async function initPresetData(FenceModel, POIModel, TargetGroupModel, TargetBindingModel, FenceTimeWindowModel, FenceAlertRuleModel, FenceActionModel) {
+const weekdayTimeSlots = [{ weekdays: [1, 2, 3, 4, 5], start_time: '08:00', end_time: '18:00' }];
+const allDayTimeSlots = [{ weekdays: [0, 1, 2, 3, 4, 5, 6], start_time: '00:00', end_time: '23:59' }];
+
+async function initPresetData(FenceModel, POIModel, TargetGroupModel, TargetBindingModel, FenceTimeWindowModel, FenceAlertRuleModel, FenceActionModel, DutyScheduleModel, WorkOrderModel, WorkOrderEscalationModel, AlertModel) {
   const existingFences = await FenceModel.getAll();
   let fenceMap = new Map();
   if (existingFences.length === 0) {
@@ -167,6 +170,167 @@ async function initPresetData(FenceModel, POIModel, TargetGroupModel, TargetBind
         }
       });
       console.log('[Preset] 已为普通区围栏配置fence_activate联动动作');
+    }
+  }
+
+  if (DutyScheduleModel) {
+    const existingSchedules = await DutyScheduleModel.getAll();
+    if (existingSchedules.length === 0) {
+      const forbiddenEnterId = forbiddenEnterFence ? forbiddenEnterFence.id : 1;
+      const forbiddenLeaveId = forbiddenLeaveFence ? forbiddenLeaveFence.id : 2;
+      const normalId = normalFence ? normalFence.id : 3;
+      const allFenceIds = [forbiddenEnterId, forbiddenLeaveId, normalId];
+
+      await DutyScheduleModel.create({
+        officer_name: '张三',
+        contact: '13800000001',
+        fence_ids: [forbiddenEnterId, forbiddenLeaveId],
+        time_slots: weekdayTimeSlots,
+        priority: 100
+      });
+
+      await DutyScheduleModel.create({
+        officer_name: '李四',
+        contact: '13800000002',
+        fence_ids: [normalId],
+        time_slots: allDayTimeSlots,
+        priority: 90
+      });
+
+      await DutyScheduleModel.create({
+        officer_name: '王五',
+        contact: '13800000003',
+        fence_ids: allFenceIds,
+        time_slots: allDayTimeSlots,
+        priority: 50
+      });
+
+      console.log('[Preset] 已创建3个值班人排班记录');
+    }
+  }
+
+  if (WorkOrderModel && AlertModel) {
+    const existingOrders = await WorkOrderModel.count();
+    if (existingOrders === 0) {
+      const forbiddenEnterId = forbiddenEnterFence ? forbiddenEnterFence.id : 1;
+      const forbiddenLeaveId = forbiddenLeaveFence ? forbiddenLeaveFence.id : 2;
+      const normalId = normalFence ? normalFence.id : 3;
+
+      const now = Date.now();
+      const twoHoursAgo = now - 2 * 60 * 60 * 1000;
+      const oneHourAgo = now - 60 * 60 * 1000;
+      const halfHourAgo = now - 30 * 60 * 1000;
+
+      const alert1 = await AlertModel.create({
+        target_id: 'T001',
+        target_name: '货运车-001',
+        fence_id: forbiddenEnterId,
+        fence_name: '禁入区-军事管理区',
+        event_type: 'enter',
+        level: 'critical',
+        lng: 116.40,
+        lat: 39.80,
+        rule_id: null,
+        group_id: 1,
+        group_name: '货运车队',
+        custom_message: '告警1'
+      });
+      await WorkOrderModel.create({
+        alert_id: alert1.id,
+        target_id: 'T001',
+        target_name: '货运车-001',
+        fence_id: forbiddenEnterId,
+        fence_name: '禁入区-军事管理区',
+        event_type: 'enter',
+        level: 'critical',
+        lng: 116.40,
+        lat: 39.80,
+        alert_timestamp: twoHoursAgo,
+        assigned_officer: '张三',
+        assigned_contact: '13800000001',
+        status: 'resolved',
+        priority_level: 100,
+        escalation_count: 0,
+        created_at: twoHoursAgo,
+        claimed_at: twoHoursAgo + 2 * 60 * 1000,
+        processing_at: twoHoursAgo + 5 * 60 * 1000,
+        resolved_at: twoHoursAgo + 25 * 60 * 1000,
+        closed_at: twoHoursAgo + 25 * 60 * 1000,
+        resolution_note: '已联系驾驶员驶离禁入区，确认是误闯路线，已上报处理。'
+      });
+
+      const alert2 = await AlertModel.create({
+        target_id: 'T005',
+        target_name: '巡逻车-002',
+        fence_id: normalId,
+        fence_name: '普通区-监控区域',
+        event_type: 'enter',
+        level: 'warning',
+        lng: 116.35,
+        lat: 39.92,
+        rule_id: null,
+        group_id: 2,
+        group_name: '巡逻车辆',
+        custom_message: '告警2'
+      });
+      await WorkOrderModel.create({
+        alert_id: alert2.id,
+        target_id: 'T005',
+        target_name: '巡逻车-002',
+        fence_id: normalId,
+        fence_name: '普通区-监控区域',
+        event_type: 'enter',
+        level: 'warning',
+        lng: 116.35,
+        lat: 39.92,
+        alert_timestamp: oneHourAgo,
+        assigned_officer: '李四',
+        assigned_contact: '13800000002',
+        status: 'resolved',
+        priority_level: 90,
+        escalation_count: 0,
+        created_at: oneHourAgo,
+        claimed_at: oneHourAgo + 45 * 1000,
+        processing_at: oneHourAgo + 2 * 60 * 1000,
+        resolved_at: oneHourAgo + 12 * 60 * 1000,
+        closed_at: oneHourAgo + 12 * 60 * 1000,
+        resolution_note: '巡逻车辆正常巡逻进入，无需处理。'
+      });
+
+      const alert3 = await AlertModel.create({
+        target_id: 'T003',
+        target_name: 'VIP车-001',
+        fence_id: forbiddenLeaveId,
+        fence_name: '禁出区-安全保护区',
+        event_type: 'leave',
+        level: 'critical',
+        lng: 116.55,
+        lat: 39.88,
+        rule_id: null,
+        group_id: 3,
+        group_name: 'VIP车辆',
+        custom_message: '告警3'
+      });
+      await WorkOrderModel.create({
+        alert_id: alert3.id,
+        target_id: 'T003',
+        target_name: 'VIP车-001',
+        fence_id: forbiddenLeaveId,
+        fence_name: '禁出区-安全保护区',
+        event_type: 'leave',
+        level: 'critical',
+        lng: 116.55,
+        lat: 39.88,
+        alert_timestamp: halfHourAgo,
+        assigned_officer: '张三',
+        assigned_contact: '13800000001',
+        status: 'pending',
+        priority_level: 100,
+        escalation_count: 0,
+        created_at: halfHourAgo
+      });
+
+      console.log('[Preset] 已创建3个示例工单（2已关闭+1待处理）');
     }
   }
 }

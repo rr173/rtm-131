@@ -163,6 +163,68 @@ db.serialize(() => {
     )
   `);
   db.run(`CREATE INDEX IF NOT EXISTS idx_heatmap_time ON heatmap_snapshots(snapshot_time)`);
+
+  db.run(`
+    CREATE TABLE IF NOT EXISTS duty_schedules (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      officer_name TEXT NOT NULL,
+      contact TEXT NOT NULL,
+      fence_ids TEXT NOT NULL,
+      time_slots TEXT NOT NULL,
+      priority INTEGER NOT NULL DEFAULT 1,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_duty_priority ON duty_schedules(priority)`);
+
+  db.run(`
+    CREATE TABLE IF NOT EXISTS work_orders (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      alert_id INTEGER NOT NULL,
+      target_id TEXT NOT NULL,
+      target_name TEXT NOT NULL,
+      fence_id INTEGER NOT NULL,
+      fence_name TEXT NOT NULL,
+      event_type TEXT NOT NULL,
+      level TEXT NOT NULL,
+      lng REAL NOT NULL,
+      lat REAL NOT NULL,
+      alert_timestamp INTEGER NOT NULL,
+      assigned_officer TEXT,
+      assigned_contact TEXT,
+      status TEXT NOT NULL DEFAULT 'pending',
+      priority_level INTEGER NOT NULL DEFAULT 0,
+      escalation_count INTEGER NOT NULL DEFAULT 0,
+      note TEXT,
+      created_at INTEGER NOT NULL,
+      claimed_at INTEGER,
+      processing_at INTEGER,
+      resolved_at INTEGER,
+      closed_at INTEGER,
+      resolution_note TEXT,
+      FOREIGN KEY (alert_id) REFERENCES alerts(id) ON DELETE CASCADE
+    )
+  `);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_wo_status ON work_orders(status)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_wo_officer ON work_orders(assigned_officer)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_wo_fence ON work_orders(fence_id)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_wo_created ON work_orders(created_at)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_wo_alert ON work_orders(alert_id)`);
+
+  db.run(`
+    CREATE TABLE IF NOT EXISTS work_order_escalations (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      work_order_id INTEGER NOT NULL,
+      from_officer TEXT,
+      to_officer TEXT,
+      to_contact TEXT,
+      escalation_time INTEGER NOT NULL,
+      reason TEXT,
+      FOREIGN KEY (work_order_id) REFERENCES work_orders(id) ON DELETE CASCADE
+    )
+  `);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_escalation_wo ON work_order_escalations(work_order_id)`);
 });
 
 function run(sql, params = []) {
@@ -701,6 +763,224 @@ const HeatmapModel = {
   }
 };
 
+const DutyScheduleModel = {
+  async getAll() {
+    const rows = await all('SELECT * FROM duty_schedules ORDER BY priority DESC, id ASC');
+    return rows.map(row => ({
+      ...row,
+      fence_ids: JSON.parse(row.fence_ids),
+      time_slots: JSON.parse(row.time_slots)
+    }));
+  },
+  async getById(id) {
+    const row = await get('SELECT * FROM duty_schedules WHERE id = ?', [id]);
+    if (!row) return null;
+    return {
+      ...row,
+      fence_ids: JSON.parse(row.fence_ids),
+      time_slots: JSON.parse(row.time_slots)
+    };
+  },
+  async create({ officer_name, contact, fence_ids, time_slots, priority }) {
+    const result = await run(
+      'INSERT INTO duty_schedules (officer_name, contact, fence_ids, time_slots, priority) VALUES (?, ?, ?, ?, ?)',
+      [officer_name, contact, JSON.stringify(fence_ids), JSON.stringify(time_slots), priority || 1]
+    );
+    return this.getById(result.lastID);
+  },
+  async update(id, { officer_name, contact, fence_ids, time_slots, priority }) {
+    const existing = await this.getById(id);
+    if (!existing) return null;
+    await run(
+      'UPDATE duty_schedules SET officer_name = ?, contact = ?, fence_ids = ?, time_slots = ?, priority = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+      [
+        officer_name || existing.officer_name,
+        contact || existing.contact,
+        fence_ids ? JSON.stringify(fence_ids) : JSON.stringify(existing.fence_ids),
+        time_slots ? JSON.stringify(time_slots) : JSON.stringify(existing.time_slots),
+        priority !== undefined ? priority : existing.priority,
+        id
+      ]
+    );
+    return this.getById(id);
+  },
+  async delete(id) {
+    await run('DELETE FROM duty_schedules WHERE id = ?', [id]);
+    return true;
+  },
+  async getByFenceIdsAndTime(fenceIds, now = new Date()) {
+    const allSchedules = await this.getAll();
+    const weekday = now.getDay();
+    const currentTime = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
+    const currentMinutes = parseInt(currentTime.split(':')[0]) * 60 + parseInt(currentTime.split(':')[1]);
+
+    const matched = [];
+    for (const schedule of allSchedules) {
+      const hasFence = fenceIds.some(fid => schedule.fence_ids.includes(fid));
+      if (!hasFence) continue;
+
+      let timeMatched = false;
+      for (const slot of schedule.time_slots) {
+        if (!slot.weekdays.includes(weekday)) continue;
+        const [startH, startM] = slot.start_time.split(':').map(Number);
+        const [endH, endM] = slot.end_time.split(':').map(Number);
+        const startMinutes = startH * 60 + startM;
+        const endMinutes = endH * 60 + endM;
+        if (startMinutes <= endMinutes) {
+          if (currentMinutes >= startMinutes && currentMinutes <= endMinutes) {
+            timeMatched = true;
+            break;
+          }
+        } else {
+          if (currentMinutes >= startMinutes || currentMinutes <= endMinutes) {
+            timeMatched = true;
+            break;
+          }
+        }
+      }
+      if (timeMatched) {
+        matched.push(schedule);
+      }
+    }
+    return matched.sort((a, b) => b.priority - a.priority);
+  }
+};
+
+const WorkOrderEscalationModel = {
+  async create({ work_order_id, from_officer, to_officer, to_contact, escalation_time, reason }) {
+    const result = await run(
+      'INSERT INTO work_order_escalations (work_order_id, from_officer, to_officer, to_contact, escalation_time, reason) VALUES (?, ?, ?, ?, ?, ?)',
+      [work_order_id, from_officer || null, to_officer || null, to_contact || null, escalation_time, reason || null]
+    );
+    return this.getById(result.lastID);
+  },
+  async getById(id) {
+    return get('SELECT * FROM work_order_escalations WHERE id = ?', [id]);
+  },
+  async getByWorkOrderId(workOrderId) {
+    return all('SELECT * FROM work_order_escalations WHERE work_order_id = ? ORDER BY escalation_time ASC', [workOrderId]);
+  }
+};
+
+const WorkOrderModel = {
+  async create(data) {
+    const result = await run(
+      `INSERT INTO work_orders (
+        alert_id, target_id, target_name, fence_id, fence_name, event_type, level,
+        lng, lat, alert_timestamp, assigned_officer, assigned_contact, status,
+        priority_level, escalation_count, note, created_at,
+        claimed_at, processing_at, resolved_at, closed_at, resolution_note
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        data.alert_id, data.target_id, data.target_name, data.fence_id, data.fence_name,
+        data.event_type, data.level, data.lng, data.lat, data.alert_timestamp,
+        data.assigned_officer || null, data.assigned_contact || null,
+        data.status || 'pending', data.priority_level || 0, data.escalation_count || 0,
+        data.note || null,
+        data.created_at || Date.now(),
+        data.claimed_at || null,
+        data.processing_at || null,
+        data.resolved_at || null,
+        data.closed_at || null,
+        data.resolution_note || null
+      ]
+    );
+    return this.getById(result.lastID);
+  },
+  async getById(id) {
+    return get('SELECT * FROM work_orders WHERE id = ?', [id]);
+  },
+  async update(id, fields) {
+    const existing = await this.getById(id);
+    if (!existing) return null;
+    const keys = Object.keys(fields);
+    if (keys.length === 0) return existing;
+    const setClause = keys.map(k => `${k} = ?`).join(', ');
+    const values = keys.map(k => fields[k]);
+    values.push(id);
+    await run(`UPDATE work_orders SET ${setClause} WHERE id = ?`, values);
+    return this.getById(id);
+  },
+  async query({ officer, fence_id, status, start_time, end_time, limit = 100, offset = 0 } = {}) {
+    let sql = 'SELECT * FROM work_orders WHERE 1=1';
+    const params = [];
+    if (officer) { sql += ' AND assigned_officer = ?'; params.push(officer); }
+    if (fence_id !== undefined) { sql += ' AND fence_id = ?'; params.push(fence_id); }
+    if (status) { sql += ' AND status = ?'; params.push(status); }
+    if (start_time) { sql += ' AND created_at >= ?'; params.push(start_time); }
+    if (end_time) { sql += ' AND created_at <= ?'; params.push(end_time); }
+    sql += ' ORDER BY created_at DESC LIMIT ? OFFSET ?';
+    params.push(limit, offset);
+    return all(sql, params);
+  },
+  async count() {
+    const row = await get('SELECT COUNT(*) as count FROM work_orders');
+    return row ? row.count : 0;
+  },
+  async getPendingOlderThan(ms) {
+    const threshold = Date.now() - ms;
+    return all(
+      `SELECT * FROM work_orders 
+       WHERE status IN ('pending', 'escalated') 
+       AND escalation_count < 3
+       AND created_at <= ?
+       ORDER BY created_at ASC`,
+      [threshold]
+    );
+  },
+  async getByAlertId(alertId) {
+    return get('SELECT * FROM work_orders WHERE alert_id = ?', [alertId]);
+  },
+  async getOfficerStats(startTime, endTime) {
+    let baseSql = `
+      SELECT 
+        assigned_officer,
+        COUNT(*) as total_orders,
+        SUM(CASE WHEN status = 'resolved' THEN 1 ELSE 0 END) as resolved_orders,
+        SUM(CASE WHEN claimed_at IS NOT NULL THEN 1 ELSE 0 END) as claimed_orders
+      FROM work_orders
+      WHERE assigned_officer IS NOT NULL
+    `;
+    const params = [];
+    if (startTime) { baseSql += ' AND created_at >= ?'; params.push(startTime); }
+    if (endTime) { baseSql += ' AND created_at <= ?'; params.push(endTime); }
+    baseSql += ' GROUP BY assigned_officer';
+    const baseStats = await all(baseSql, params);
+
+    let detailedSql = `
+      SELECT 
+        assigned_officer,
+        AVG(claimed_at - created_at) as avg_response_ms,
+        AVG(CASE WHEN resolved_at IS NOT NULL AND claimed_at IS NOT NULL THEN resolved_at - claimed_at END) as avg_process_ms,
+        SUM(CASE WHEN escalation_count > 0 THEN 1 ELSE 0 END) as escalated_orders
+      FROM work_orders
+      WHERE assigned_officer IS NOT NULL
+    `;
+    const detailedParams = [];
+    if (startTime) { detailedSql += ' AND created_at >= ?'; detailedParams.push(startTime); }
+    if (endTime) { detailedSql += ' AND created_at <= ?'; detailedParams.push(endTime); }
+    detailedSql += ' GROUP BY assigned_officer';
+    const detailedStats = await all(detailedSql, detailedParams);
+
+    const detailedMap = new Map();
+    detailedStats.forEach(d => detailedMap.set(d.assigned_officer, d));
+
+    return baseStats.map(b => {
+      const d = detailedMap.get(b.assigned_officer) || {};
+      const total = b.total_orders || 0;
+      return {
+        officer_name: b.assigned_officer,
+        total_orders: total,
+        resolved_orders: b.resolved_orders || 0,
+        claimed_orders: b.claimed_orders || 0,
+        avg_response_seconds: d.avg_response_ms ? Math.round(d.avg_response_ms / 1000) : 0,
+        avg_process_seconds: d.avg_process_ms ? Math.round(d.avg_process_ms / 1000) : 0,
+        escalation_rate: total > 0 ? Math.round(((d.escalated_orders || 0) / total) * 100) / 100 : 0
+      };
+    });
+  }
+};
+
 module.exports = {
   db,
   FenceModel,
@@ -713,5 +993,8 @@ module.exports = {
   FenceActionModel,
   FenceActivationOverrideModel,
   TrajectoryModel,
-  HeatmapModel
+  HeatmapModel,
+  DutyScheduleModel,
+  WorkOrderModel,
+  WorkOrderEscalationModel
 };

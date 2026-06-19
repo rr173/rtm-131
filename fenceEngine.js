@@ -5,9 +5,10 @@ const https = require('https');
 const url = require('url');
 
 class FenceEngine {
-  constructor(onAlert, onFenceStatusChange) {
+  constructor(onAlert, onFenceStatusChange, onWorkOrderTrigger) {
     this.onAlert = onAlert;
     this.onFenceStatusChange = onFenceStatusChange;
+    this.onWorkOrderTrigger = onWorkOrderTrigger;
     this.targetStates = new Map();
     this.targetPositions = new Map();
     this.fenceStats = new Map();
@@ -311,15 +312,19 @@ class FenceEngine {
         group_name: groupName,
         custom_message: customMessage
       });
+      const alertPayload = {
+        ...alert,
+        timestamp: new Date(alert.timestamp).getTime(),
+        rule_id: ruleId,
+        group_id: groupId,
+        group_name: groupName,
+        custom_message: customMessage
+      };
       if (this.onAlert) {
-        this.onAlert({
-          ...alert,
-          timestamp: new Date(alert.timestamp).getTime(),
-          rule_id: ruleId,
-          group_id: groupId,
-          group_name: groupName,
-          custom_message: customMessage
-        });
+        this.onAlert(alertPayload);
+      }
+      if (this.onWorkOrderTrigger) {
+        this.onWorkOrderTrigger(alertPayload);
       }
     }
 
@@ -390,15 +395,19 @@ class FenceEngine {
         group_name: groupName,
         custom_message: customMessage
       });
+      const alertPayload = {
+        ...alert,
+        timestamp: new Date(alert.timestamp).getTime(),
+        rule_id: ruleId,
+        group_id: groupId,
+        group_name: groupName,
+        custom_message: customMessage
+      };
       if (this.onAlert) {
-        this.onAlert({
-          ...alert,
-          timestamp: new Date(alert.timestamp).getTime(),
-          rule_id: ruleId,
-          group_id: groupId,
-          group_name: groupName,
-          custom_message: customMessage
-        });
+        this.onAlert(alertPayload);
+      }
+      if (this.onWorkOrderTrigger) {
+        this.onWorkOrderTrigger(alertPayload);
       }
     }
 
