@@ -651,8 +651,18 @@ const TrajectoryModel = {
       WHERE 1=1
     `;
     const params = [];
-    if (start_time) { sql += ' AND timestamp >= ?'; params.push(start_time); }
-    if (end_time) { sql += ' AND timestamp <= ?'; params.push(end_time); }
+    if (start_time) {
+      const startStr = typeof start_time === 'number'
+        ? new Date(start_time).toISOString().replace('T', ' ').replace(/\.\d+Z$/, '')
+        : start_time;
+      sql += ' AND timestamp >= ?'; params.push(startStr);
+    }
+    if (end_time) {
+      const endStr = typeof end_time === 'number'
+        ? new Date(end_time).toISOString().replace('T', ' ').replace(/\.\d+Z$/, '')
+        : end_time;
+      sql += ' AND timestamp <= ?'; params.push(endStr);
+    }
     if (group_id !== undefined && group_id !== null) { sql += ' AND group_id = ?'; params.push(group_id); }
     if (event_type) { sql += ' AND event_type = ?'; params.push(event_type); }
     

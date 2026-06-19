@@ -236,26 +236,50 @@ async function main() {
     if (group_id === undefined) {
       return res.status(400).json({ error: '需要指定group_id' });
     }
-    const rule = await FenceAlertRuleModel.create({
-      fence_id: id,
-      group_id,
-      enter_level,
-      leave_level,
-      message_template
-    });
-    await fenceEngine.reloadFences();
-    res.status(201).json(rule);
+    const validLevels = ['none', 'info', 'warning', 'critical'];
+    if (enter_level !== undefined && !validLevels.includes(enter_level)) {
+      return res.status(400).json({ error: `enter_level 无效，合法值: ${validLevels.join(', ')}` });
+    }
+    if (leave_level !== undefined && !validLevels.includes(leave_level)) {
+      return res.status(400).json({ error: `leave_level 无效，合法值: ${validLevels.join(', ')}` });
+    }
+    try {
+      const rule = await FenceAlertRuleModel.create({
+        fence_id: id,
+        group_id,
+        enter_level,
+        leave_level,
+        message_template
+      });
+      await fenceEngine.reloadFences();
+      res.status(201).json(rule);
+    } catch (err) {
+      console.error('[API] 创建告警规则失败:', err);
+      res.status(500).json({ error: err.message });
+    }
   });
 
   app.put('/api/rules/:id', async (req, res) => {
     const { id } = req.params;
     const { enter_level, leave_level, message_template } = req.body;
-    const rule = await FenceAlertRuleModel.update(id, { enter_level, leave_level, message_template });
-    if (!rule) {
-      return res.status(404).json({ error: '规则不存在' });
+    const validLevels = ['none', 'info', 'warning', 'critical'];
+    if (enter_level !== undefined && !validLevels.includes(enter_level)) {
+      return res.status(400).json({ error: `enter_level 无效，合法值: ${validLevels.join(', ')}` });
     }
-    await fenceEngine.reloadFences();
-    res.json(rule);
+    if (leave_level !== undefined && !validLevels.includes(leave_level)) {
+      return res.status(400).json({ error: `leave_level 无效，合法值: ${validLevels.join(', ')}` });
+    }
+    try {
+      const rule = await FenceAlertRuleModel.update(id, { enter_level, leave_level, message_template });
+      if (!rule) {
+        return res.status(404).json({ error: '规则不存在' });
+      }
+      await fenceEngine.reloadFences();
+      res.json(rule);
+    } catch (err) {
+      console.error('[API] 更新告警规则失败:', err);
+      res.status(500).json({ error: err.message });
+    }
   });
 
   app.delete('/api/rules/:id', async (req, res) => {
