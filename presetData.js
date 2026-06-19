@@ -219,7 +219,7 @@ async function initPresetData(FenceModel, POIModel, TargetGroupModel, TargetBind
       const now = Date.now();
       const twoHoursAgo = now - 2 * 60 * 60 * 1000;
       const oneHourAgo = now - 60 * 60 * 1000;
-      const halfHourAgo = now - 30 * 60 * 1000;
+      const oneMinuteAgo = now - 60 * 1000;
 
       const alert1 = await AlertModel.create({
         target_id: 'T001',
@@ -252,6 +252,7 @@ async function initPresetData(FenceModel, POIModel, TargetGroupModel, TargetBind
         priority_level: 100,
         escalation_count: 0,
         created_at: twoHoursAgo,
+        last_assigned_at: twoHoursAgo,
         claimed_at: twoHoursAgo + 2 * 60 * 1000,
         processing_at: twoHoursAgo + 5 * 60 * 1000,
         resolved_at: twoHoursAgo + 25 * 60 * 1000,
@@ -290,6 +291,7 @@ async function initPresetData(FenceModel, POIModel, TargetGroupModel, TargetBind
         priority_level: 90,
         escalation_count: 0,
         created_at: oneHourAgo,
+        last_assigned_at: oneHourAgo,
         claimed_at: oneHourAgo + 45 * 1000,
         processing_at: oneHourAgo + 2 * 60 * 1000,
         resolved_at: oneHourAgo + 12 * 60 * 1000,
@@ -321,13 +323,14 @@ async function initPresetData(FenceModel, POIModel, TargetGroupModel, TargetBind
         level: 'critical',
         lng: 116.55,
         lat: 39.88,
-        alert_timestamp: halfHourAgo,
+        alert_timestamp: oneMinuteAgo,
         assigned_officer: '张三',
         assigned_contact: '13800000001',
         status: 'pending',
         priority_level: 100,
         escalation_count: 0,
-        created_at: halfHourAgo
+        created_at: oneMinuteAgo,
+        last_assigned_at: oneMinuteAgo
       });
 
       console.log('[Preset] 已创建3个示例工单（2已关闭+1待处理）');

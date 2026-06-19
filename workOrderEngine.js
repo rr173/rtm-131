@@ -49,7 +49,8 @@ class WorkOrderEngine {
       status: status,
       priority_level: priorityLevel,
       escalation_count: 0,
-      created_at: Date.now()
+      created_at: Date.now(),
+      last_assigned_at: Date.now()
     });
 
     console.log(`[WorkOrder] 工单 #${workOrder.id} 已创建: 告警#${alert.id}, 值班人: ${assignedOfficer || '无人'}, 状态: ${status}`);
@@ -103,8 +104,8 @@ class WorkOrderEngine {
   async resolveWorkOrder(workOrderId, officerName, resolutionNote) {
     const order = await WorkOrderModel.getById(workOrderId);
     if (!order) throw new Error('工单不存在');
-    if (order.status !== 'claimed' && order.status !== 'processing') {
-      throw new Error('只有已认领或处理中的工单才能关闭');
+    if (order.status !== 'processing') {
+      throw new Error('只有处理中的工单才能关闭，请先开始处理');
     }
     if (order.assigned_officer !== officerName) throw new Error('该工单不属于您');
     if (!resolutionNote || !resolutionNote.trim()) throw new Error('必须填写处理备注');
@@ -181,12 +182,14 @@ class WorkOrderEngine {
     }
 
     const newCount = order.escalation_count + 1;
+    const now = Date.now();
     const updated = await WorkOrderModel.update(workOrderId, {
       assigned_officer: nextSchedule.officer_name,
       assigned_contact: nextSchedule.contact,
       status: newCount >= MAX_ESCALATIONS ? 'unattended' : 'pending',
       priority_level: nextSchedule.priority,
-      escalation_count: newCount
+      escalation_count: newCount,
+      last_assigned_at: now
     });
 
     await WorkOrderEscalationModel.create({
@@ -207,7 +210,8 @@ class WorkOrderEngine {
     const pending = await WorkOrderModel.getPendingOlderThan(CLAIM_TIMEOUT_MS);
     for (const order of pending) {
       try {
-        const age = Date.now() - order.created_at;
+        const assignedAt = order.last_assigned_at || order.created_at;
+        const age = Date.now() - assignedAt;
         if (age >= CLAIM_TIMEOUT_MS && !order.claimed_at) {
           await this._escalateWorkOrder(order.id);
         }

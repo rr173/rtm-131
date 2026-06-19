@@ -198,6 +198,7 @@ db.serialize(() => {
       escalation_count INTEGER NOT NULL DEFAULT 0,
       note TEXT,
       created_at INTEGER NOT NULL,
+      last_assigned_at INTEGER NOT NULL,
       claimed_at INTEGER,
       processing_at INTEGER,
       resolved_at INTEGER,
@@ -868,9 +869,9 @@ const WorkOrderModel = {
       `INSERT INTO work_orders (
         alert_id, target_id, target_name, fence_id, fence_name, event_type, level,
         lng, lat, alert_timestamp, assigned_officer, assigned_contact, status,
-        priority_level, escalation_count, note, created_at,
+        priority_level, escalation_count, note, created_at, last_assigned_at,
         claimed_at, processing_at, resolved_at, closed_at, resolution_note
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         data.alert_id, data.target_id, data.target_name, data.fence_id, data.fence_name,
         data.event_type, data.level, data.lng, data.lat, data.alert_timestamp,
@@ -878,6 +879,7 @@ const WorkOrderModel = {
         data.status || 'pending', data.priority_level || 0, data.escalation_count || 0,
         data.note || null,
         data.created_at || Date.now(),
+        data.last_assigned_at || data.created_at || Date.now(),
         data.claimed_at || null,
         data.processing_at || null,
         data.resolved_at || null,
@@ -923,7 +925,7 @@ const WorkOrderModel = {
       `SELECT * FROM work_orders 
        WHERE status IN ('pending', 'escalated') 
        AND escalation_count < 3
-       AND created_at <= ?
+       AND COALESCE(last_assigned_at, created_at) <= ?
        ORDER BY created_at ASC`,
       [threshold]
     );
