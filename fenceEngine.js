@@ -9,6 +9,7 @@ class FenceEngine {
     this.onAlert = onAlert;
     this.onFenceStatusChange = onFenceStatusChange;
     this.onWorkOrderTrigger = onWorkOrderTrigger;
+    this.capacityManager = null;
     this.targetStates = new Map();
     this.targetPositions = new Map();
     this.fenceStats = new Map();
@@ -21,6 +22,10 @@ class FenceEngine {
     this.activationOverrides = new Map();
     this.fenceActiveStatus = new Map();
     this.lastFenceStatusCheck = 0;
+  }
+
+  setCapacityManager(capacityManager) {
+    this.capacityManager = capacityManager;
   }
 
   async reloadFences() {
@@ -93,10 +98,22 @@ class FenceEngine {
 
     if (wasActive && !isActive) {
       this.clearFenceTargetStates(fence.id);
+      if (this.capacityManager) {
+        this.capacityManager.onFenceDeactivated(fence.id).catch(err => {
+          console.error('[Capacity] 围栏停用容量通知失败:', err.message);
+        });
+      }
     }
 
     if (!wasActive && isActive) {
       this.recalculateFenceTargets(fence);
+      if (this.capacityManager) {
+        const stats = this.fenceStats.get(fence.id);
+        const count = stats ? stats.currentTargets.size : 0;
+        this.capacityManager.onFenceReactivated(fence.id, count).catch(err => {
+          console.error('[Capacity] 围栏激活容量通知失败:', err.message);
+        });
+      }
     }
   }
 
@@ -269,62 +286,103 @@ class FenceEngine {
     const enterKey = `${targetId}_${fence.id}`;
     this.enterTimes.set(enterKey, timestamp);
 
-    const rule = this.matchAlertRule(fence.id, groupId);
-    let level = 'warning';
-    let shouldAlert = true;
-    let ruleId = null;
-    let customMessage = null;
+    const currentCount = stats.currentTargets.size;
+    const isActive = this.isFenceActive(fence.id);
 
-    if (rule) {
-      level = rule.enter_level;
-      ruleId = rule.id;
-      shouldAlert = level !== 'none';
-      if (rule.message_template) {
-        customMessage = this.renderMessageTemplate(rule.message_template, {
-          target_name: targetName,
-          fence_name: fence.name,
-          time: new Date(timestamp).toLocaleString(),
-          event_type: '进入'
-        });
-      }
-    } else {
-      if (fence.type === 'forbidden_enter') {
-        level = 'critical';
-      } else if (fence.type === 'normal') {
-        level = 'warning';
-      } else {
-        shouldAlert = false;
-      }
+    let capacityOverlimit = false;
+    if (this.capacityManager && this.capacityManager.hasCapacity(fence.id)) {
+      const result = await this.capacityManager.onTargetEnter(
+        fence.id, fence.name, targetId, targetName, timestamp, currentCount, isActive
+      );
+      capacityOverlimit = result.overlimit;
     }
 
-    if (shouldAlert) {
+    if (capacityOverlimit) {
+      const config = this.capacityManager.getConfig(fence.id);
       const alert = await AlertModel.create({
         target_id: targetId,
         target_name: targetName,
         fence_id: fence.id,
         fence_name: fence.name,
         event_type: 'enter',
-        level,
+        level: 'critical',
         lng,
         lat,
-        rule_id: ruleId,
+        rule_id: null,
         group_id: groupId,
         group_name: groupName,
-        custom_message: customMessage
+        custom_message: `容量超限: 目标${targetName}进入已满载围栏${fence.name}(容量${currentCount}/${config.max_capacity})`
       });
       const alertPayload = {
         ...alert,
         timestamp: new Date(alert.timestamp).getTime(),
-        rule_id: ruleId,
+        rule_id: null,
         group_id: groupId,
         group_name: groupName,
-        custom_message: customMessage
+        custom_message: alert.custom_message,
+        capacity_overlimit: true
       };
       if (this.onAlert) {
         this.onAlert(alertPayload);
       }
-      if (this.onWorkOrderTrigger) {
-        this.onWorkOrderTrigger(alertPayload);
+    } else {
+      const rule = this.matchAlertRule(fence.id, groupId);
+      let level = 'warning';
+      let shouldAlert = true;
+      let ruleId = null;
+      let customMessage = null;
+
+      if (rule) {
+        level = rule.enter_level;
+        ruleId = rule.id;
+        shouldAlert = level !== 'none';
+        if (rule.message_template) {
+          customMessage = this.renderMessageTemplate(rule.message_template, {
+            target_name: targetName,
+            fence_name: fence.name,
+            time: new Date(timestamp).toLocaleString(),
+            event_type: '进入'
+          });
+        }
+      } else {
+        if (fence.type === 'forbidden_enter') {
+          level = 'critical';
+        } else if (fence.type === 'normal') {
+          level = 'warning';
+        } else {
+          shouldAlert = false;
+        }
+      }
+
+      if (shouldAlert) {
+        const alert = await AlertModel.create({
+          target_id: targetId,
+          target_name: targetName,
+          fence_id: fence.id,
+          fence_name: fence.name,
+          event_type: 'enter',
+          level,
+          lng,
+          lat,
+          rule_id: ruleId,
+          group_id: groupId,
+          group_name: groupName,
+          custom_message: customMessage
+        });
+        const alertPayload = {
+          ...alert,
+          timestamp: new Date(alert.timestamp).getTime(),
+          rule_id: ruleId,
+          group_id: groupId,
+          group_name: groupName,
+          custom_message: customMessage
+        };
+        if (this.onAlert) {
+          this.onAlert(alertPayload);
+        }
+        if (this.onWorkOrderTrigger) {
+          this.onWorkOrderTrigger(alertPayload);
+        }
       }
     }
 
@@ -350,6 +408,17 @@ class FenceEngine {
         groupStats.stayCount++;
       }
       this.enterTimes.delete(enterKey);
+    }
+
+    const currentCount = stats.currentTargets.size;
+    const isActive = this.isFenceActive(fence.id);
+
+    if (this.capacityManager && this.capacityManager.hasCapacity(fence.id)) {
+      await this.capacityManager.onTargetLeave(
+        fence.id, fence.name, targetId, targetName, timestamp, currentCount, isActive
+      ).catch(err => {
+        console.error('[Capacity] 离开容量通知失败:', err.message);
+      });
     }
 
     const rule = this.matchAlertRule(fence.id, groupId);
@@ -611,6 +680,9 @@ class FenceEngine {
         stats.stayCount = 0;
       });
     });
+    if (this.capacityManager) {
+      this.capacityManager.resetDailyStats();
+    }
   }
 
   getFenceActiveStatus(fenceId) {

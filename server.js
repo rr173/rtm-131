@@ -25,7 +25,9 @@ const {
   OfflineStatsModel,
   FormationModel,
   FormationMemberModel,
-  FormationEventModel
+  FormationEventModel,
+  CapacityConfigModel,
+  CapacityEventModel
 } = require('./database');
 const { FenceEngine } = require('./fenceEngine');
 const { WorkOrderEngine } = require('./workOrderEngine');
@@ -38,6 +40,7 @@ const { PatrolEngine } = require('./patrolEngine');
 const { BehaviorEngine } = require('./behaviorEngine');
 const { HeartbeatMonitor, STATUS_ONLINE, STATUS_OFFLINE, STATUS_UNKNOWN } = require('./heartbeatMonitor');
 const { FormationEngine } = require('./formationEngine');
+const { CapacityManager } = require('./capacityManager');
 
 const app = express();
 const server = http.createServer(app);
@@ -71,9 +74,10 @@ let patrolEngine;
 let behaviorEngine;
 let heartbeatMonitor;
 let formationEngine;
+let capacityManager;
 
 async function main() {
-  await initPresetData(FenceModel, POIModel, TargetGroupModel, TargetBindingModel, FenceTimeWindowModel, FenceAlertRuleModel, FenceActionModel, DutyScheduleModel, WorkOrderModel, WorkOrderEscalationModel, AlertModel, PatrolTaskModel);
+  await initPresetData(FenceModel, POIModel, TargetGroupModel, TargetBindingModel, FenceTimeWindowModel, FenceAlertRuleModel, FenceActionModel, DutyScheduleModel, WorkOrderModel, WorkOrderEscalationModel, AlertModel, PatrolTaskModel, CapacityConfigModel);
 
   workOrderEngine = new WorkOrderEngine((update) => {
     broadcast({
@@ -104,6 +108,12 @@ async function main() {
     }
   );
   await fenceEngine.reloadFences();
+
+  capacityManager = new CapacityManager((statusChange) => {
+    broadcast({ type: 'capacity_status_change', data: statusChange });
+  });
+  await capacityManager.loadConfigs();
+  fenceEngine.setCapacityManager(capacityManager);
 
   replayManager = new ReplayManager(
     broadcast,
@@ -236,6 +246,10 @@ async function main() {
     if (formationEngine) {
       const allFormations = formationEngine.getAllFormations();
       ws.send(JSON.stringify({ type: 'formation_list', data: allFormations }));
+    }
+    if (capacityManager) {
+      const capacitySummaries = await capacityManager.getAllCapacitySummaries();
+      ws.send(JSON.stringify({ type: 'capacity_summaries', data: capacitySummaries }));
     }
     ws.on('close', () => {
       clients.delete(ws);
@@ -1765,6 +1779,177 @@ async function main() {
       res.json({ count: events.length, events });
     } catch (err) {
       console.error('[API] 查询编队事件失败:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.get('/api/capacity/config', async (req, res) => {
+    try {
+      const configs = await CapacityConfigModel.getAll();
+      const result = [];
+      for (const cfg of configs) {
+        const fence = await FenceModel.getById(cfg.fence_id);
+        result.push({
+          ...cfg,
+          fence_name: fence ? fence.name : null
+        });
+      }
+      res.json(result);
+    } catch (err) {
+      console.error('[API] 获取容量配置失败:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.get('/api/capacity/config/:fence_id', async (req, res) => {
+    try {
+      const { fence_id } = req.params;
+      const config = await CapacityConfigModel.getByFenceId(parseInt(fence_id));
+      if (!config) return res.status(404).json({ error: '该围栏未配置容量' });
+      const fence = await FenceModel.getById(config.fence_id);
+      res.json({ ...config, fence_name: fence ? fence.name : null });
+    } catch (err) {
+      console.error('[API] 获取容量配置失败:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.put('/api/capacity/config/:fence_id', async (req, res) => {
+    try {
+      const { fence_id } = req.params;
+      const { max_capacity, warning_threshold_pct } = req.body;
+      if (max_capacity === undefined || warning_threshold_pct === undefined) {
+        return res.status(400).json({ error: '需要指定 max_capacity 和 warning_threshold_pct' });
+      }
+      const fence = await FenceModel.getById(parseInt(fence_id));
+      if (!fence) return res.status(404).json({ error: '围栏不存在' });
+      const config = await capacityManager.setConfig(parseInt(fence_id), {
+        max_capacity: parseInt(max_capacity),
+        warning_threshold_pct: parseFloat(warning_threshold_pct)
+      });
+      const stats = fenceEngine.getStatistics().find(s => s.fence_id === parseInt(fence_id));
+      if (stats) {
+        capacityManager.setCurrentCount(parseInt(fence_id), stats.current_targets);
+      }
+      res.json(config);
+    } catch (err) {
+      console.error('[API] 设置容量配置失败:', err);
+      res.status(400).json({ error: err.message });
+    }
+  });
+
+  app.delete('/api/capacity/config/:fence_id', async (req, res) => {
+    try {
+      const { fence_id } = req.params;
+      await capacityManager.deleteConfig(parseInt(fence_id));
+      res.json({ success: true });
+    } catch (err) {
+      console.error('[API] 删除容量配置失败:', err);
+      res.status(400).json({ error: err.message });
+    }
+  });
+
+  app.get('/api/capacity/summary', async (req, res) => {
+    try {
+      const { configured_only } = req.query;
+      if (configured_only === 'true' || configured_only === '1') {
+        const summaries = await capacityManager.getAllCapacitySummaries();
+        return res.json(summaries);
+      }
+      const fences = await FenceModel.getAll();
+      const result = [];
+      for (const fence of fences) {
+        const summary = await capacityManager.getCapacitySummary(fence.id);
+        if (summary) {
+          result.push(summary);
+        } else {
+          const stats = fenceEngine.getStatistics().find(s => s.fence_id === fence.id);
+          result.push({
+            fence_id: fence.id,
+            fence_name: fence.name,
+            current_count: stats ? stats.current_targets : 0,
+            max_capacity: null,
+            ratio: 0,
+            status: 'normal',
+            warning_threshold_pct: null,
+            warning_threshold_count: null,
+            predicted_minutes_to_full: null,
+            today_full_count: 0
+          });
+        }
+      }
+      res.json(result);
+    } catch (err) {
+      console.error('[API] 获取容量摘要失败:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.get('/api/capacity/summary/:fence_id', async (req, res) => {
+    try {
+      const { fence_id } = req.params;
+      const summary = await capacityManager.getCapacitySummary(parseInt(fence_id));
+      if (!summary) return res.status(404).json({ error: '该围栏未配置容量' });
+      res.json(summary);
+    } catch (err) {
+      console.error('[API] 获取围栏容量摘要失败:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.get('/api/capacity/events', async (req, res) => {
+    try {
+      const { fence_id, event_type, start_time, end_time, limit, offset } = req.query;
+      const events = await CapacityEventModel.query({
+        fence_id: fence_id ? parseInt(fence_id) : undefined,
+        event_type,
+        start_time: start_time ? parseInt(start_time) : undefined,
+        end_time: end_time ? parseInt(end_time) : undefined,
+        limit: limit ? parseInt(limit) : 100,
+        offset: offset ? parseInt(offset) : 0
+      });
+      res.json({ count: events.length, events });
+    } catch (err) {
+      console.error('[API] 查询容量事件失败:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.get('/api/capacity/stats/:fence_id', async (req, res) => {
+    try {
+      const { fence_id } = req.params;
+      const { start_time, end_time } = req.query;
+      const now = Date.now();
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+      const dayStart = today.getTime();
+
+      const startTime = start_time ? parseInt(start_time) : dayStart;
+      const endTime = end_time ? parseInt(end_time) : now;
+
+      const fence = await FenceModel.getById(parseInt(fence_id));
+      if (!fence) return res.status(404).json({ error: '围栏不存在' });
+
+      const fullDuration = await CapacityEventModel.getDailyFullDuration(parseInt(fence_id), startTime, endTime);
+      const hourlyPeaks = await CapacityEventModel.getHourlyPeakUtilization(parseInt(fence_id), startTime, endTime);
+
+      const hourlyDistribution = hourlyPeaks.map(h => ({
+        hour: new Date(h.hour_bucket * 3600000).getHours(),
+        peak_count: h.peak_count,
+        peak_pct: h.peak_pct
+      }));
+
+      res.json({
+        fence_id: parseInt(fence_id),
+        fence_name: fence.name,
+        period_start: startTime,
+        period_end: endTime,
+        avg_daily_full_duration_ms: fullDuration,
+        avg_daily_full_duration_seconds: Math.round(fullDuration / 1000),
+        hourly_peak_utilization: hourlyDistribution
+      });
+    } catch (err) {
+      console.error('[API] 获取容量统计失败:', err);
       res.status(500).json({ error: err.message });
     }
   });

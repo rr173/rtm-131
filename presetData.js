@@ -62,7 +62,7 @@ const presetBindings = [
 const weekdayTimeSlots = [{ weekdays: [1, 2, 3, 4, 5], start_time: '08:00', end_time: '18:00' }];
 const allDayTimeSlots = [{ weekdays: [0, 1, 2, 3, 4, 5, 6], start_time: '00:00', end_time: '23:59' }];
 
-async function initPresetData(FenceModel, POIModel, TargetGroupModel, TargetBindingModel, FenceTimeWindowModel, FenceAlertRuleModel, FenceActionModel, DutyScheduleModel, WorkOrderModel, WorkOrderEscalationModel, AlertModel, PatrolTaskModel) {
+async function initPresetData(FenceModel, POIModel, TargetGroupModel, TargetBindingModel, FenceTimeWindowModel, FenceAlertRuleModel, FenceActionModel, DutyScheduleModel, WorkOrderModel, WorkOrderEscalationModel, AlertModel, PatrolTaskModel, CapacityConfigModel) {
   const existingFences = await FenceModel.getAll();
   let fenceMap = new Map();
   if (existingFences.length === 0) {
@@ -152,6 +152,31 @@ async function initPresetData(FenceModel, POIModel, TargetGroupModel, TargetBind
         message_template: '目标{target_name}于{time}{event_type}围栏{fence_name}'
       });
       console.log('[Preset] 已为禁入区围栏配置差异化告警规则');
+    }
+  }
+
+  if (CapacityConfigModel && forbiddenEnterFence) {
+    const existingCapConfigs = await CapacityConfigModel.getAll();
+    if (existingCapConfigs.length === 0) {
+      await CapacityConfigModel.set(forbiddenEnterFence.id, {
+        max_capacity: 2,
+        warning_threshold_pct: 80
+      });
+      console.log('[Preset] 已为禁入区围栏配置容量: 最大2, 预警阈值80%');
+    }
+  }
+
+  if (CapacityConfigModel && normalFence) {
+    const existingCapConfigs = await CapacityConfigModel.getAll();
+    if (existingCapConfigs.length === 0 || (existingCapConfigs.length === 1 && forbiddenEnterFence)) {
+      const alreadySet = await CapacityConfigModel.getByFenceId(normalFence.id);
+      if (!alreadySet) {
+        await CapacityConfigModel.set(normalFence.id, {
+          max_capacity: 3,
+          warning_threshold_pct: 70
+        });
+        console.log('[Preset] 已为普通区围栏配置容量: 最大3, 预警阈值70%');
+      }
     }
   }
 

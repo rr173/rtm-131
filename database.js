@@ -392,6 +392,42 @@ db.serialize(() => {
       updated_at INTEGER NOT NULL
     )
   `);
+
+  db.run(`
+    CREATE TABLE IF NOT EXISTS fence_capacity_config (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      fence_id INTEGER NOT NULL UNIQUE,
+      max_capacity INTEGER NOT NULL,
+      warning_threshold_pct REAL NOT NULL DEFAULT 80.0,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (fence_id) REFERENCES fences(id) ON DELETE CASCADE
+    )
+  `);
+
+  db.run(`
+    CREATE TABLE IF NOT EXISTS capacity_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      fence_id INTEGER NOT NULL,
+      fence_name TEXT NOT NULL,
+      event_type TEXT NOT NULL CHECK(event_type IN ('capacity_warning', 'capacity_full', 'capacity_normal', 'capacity_overlimit')),
+      old_status TEXT,
+      new_status TEXT NOT NULL,
+      current_count INTEGER NOT NULL,
+      max_capacity INTEGER NOT NULL,
+      target_id TEXT,
+      target_name TEXT,
+      timestamp INTEGER NOT NULL,
+      details TEXT,
+      created_at INTEGER NOT NULL,
+      FOREIGN KEY (fence_id) REFERENCES fences(id) ON DELETE CASCADE
+    )
+  `);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_cap_cfg_fence ON fence_capacity_config(fence_id)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_cap_evt_fence ON capacity_events(fence_id)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_cap_evt_type ON capacity_events(event_type)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_cap_evt_time ON capacity_events(timestamp)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_cap_evt_fence_time ON capacity_events(fence_id, timestamp)`);
 });
 
 function run(sql, params = []) {
@@ -1769,6 +1805,104 @@ const FormationEventModel = {
   }
 };
 
+const CapacityConfigModel = {
+  async getByFenceId(fenceId) {
+    return get('SELECT * FROM fence_capacity_config WHERE fence_id = ?', [fenceId]);
+  },
+  async getAll() {
+    return all('SELECT * FROM fence_capacity_config ORDER BY fence_id');
+  },
+  async set(fenceId, { max_capacity, warning_threshold_pct }) {
+    const existing = await this.getByFenceId(fenceId);
+    if (existing) {
+      await run(
+        'UPDATE fence_capacity_config SET max_capacity = ?, warning_threshold_pct = ?, updated_at = CURRENT_TIMESTAMP WHERE fence_id = ?',
+        [max_capacity, warning_threshold_pct, fenceId]
+      );
+    } else {
+      await run(
+        'INSERT INTO fence_capacity_config (fence_id, max_capacity, warning_threshold_pct) VALUES (?, ?, ?)',
+        [fenceId, max_capacity, warning_threshold_pct]
+      );
+    }
+    return this.getByFenceId(fenceId);
+  },
+  async delete(fenceId) {
+    await run('DELETE FROM fence_capacity_config WHERE fence_id = ?', [fenceId]);
+    return true;
+  }
+};
+
+const CapacityEventModel = {
+  async create({ fence_id, fence_name, event_type, old_status, new_status, current_count, max_capacity, target_id, target_name, timestamp, details }) {
+    const now = Date.now();
+    const result = await run(
+      `INSERT INTO capacity_events
+        (fence_id, fence_name, event_type, old_status, new_status, current_count, max_capacity, target_id, target_name, timestamp, details, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [fence_id, fence_name, event_type, old_status || null, new_status,
+       current_count, max_capacity, target_id || null, target_name || null,
+       timestamp, details ? JSON.stringify(details) : null, now]
+    );
+    return this.getById(result.lastID);
+  },
+  async getById(id) {
+    const row = await get('SELECT * FROM capacity_events WHERE id = ?', [id]);
+    if (!row) return null;
+    return { ...row, details: row.details ? JSON.parse(row.details) : null };
+  },
+  async query({ fence_id, event_type, start_time, end_time, limit = 100, offset = 0 } = {}) {
+    let sql = 'SELECT * FROM capacity_events WHERE 1=1';
+    const params = [];
+    if (fence_id !== undefined) { sql += ' AND fence_id = ?'; params.push(fence_id); }
+    if (event_type) { sql += ' AND event_type = ?'; params.push(event_type); }
+    if (start_time) { sql += ' AND timestamp >= ?'; params.push(start_time); }
+    if (end_time) { sql += ' AND timestamp <= ?'; params.push(end_time); }
+    sql += ' ORDER BY timestamp DESC LIMIT ? OFFSET ?';
+    params.push(limit, offset);
+    const rows = await all(sql, params);
+    return rows.map(row => ({ ...row, details: row.details ? JSON.parse(row.details) : null }));
+  },
+  async getDailyFullDuration(fenceId, dayStart, dayEnd) {
+    const rows = await all(
+      `SELECT
+         SUM(CASE
+           WHEN event_type = 'capacity_normal' AND old_status = 'full' THEN (timestamp - LAG(timestamp) OVER (PARTITION BY fence_id ORDER BY timestamp))
+           ELSE 0
+         END) as full_duration_ms
+       FROM capacity_events
+       WHERE fence_id = ? AND timestamp >= ? AND timestamp <= ?
+       ORDER BY timestamp`,
+      [fenceId, dayStart, dayEnd]
+    );
+    return rows && rows[0] ? (rows[0].full_duration_ms || 0) : 0;
+  },
+  async getHourlyPeakUtilization(fenceId, dayStart, dayEnd) {
+    return all(
+      `SELECT
+         (timestamp / 3600000) as hour_bucket,
+         MAX(current_count) as peak_count,
+         MAX(CASE WHEN max_capacity > 0 THEN ROUND(current_count * 100.0 / max_capacity, 1) ELSE 0 END) as peak_pct
+       FROM capacity_events
+       WHERE fence_id = ? AND timestamp >= ? AND timestamp <= ?
+       GROUP BY hour_bucket
+       ORDER BY hour_bucket`,
+      [fenceId, dayStart, dayEnd]
+    );
+  },
+  async getTodayFullCount(fenceId) {
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const dayStart = today.getTime();
+    const row = await get(
+      `SELECT COUNT(*) as count FROM capacity_events
+       WHERE fence_id = ? AND event_type = 'capacity_full' AND timestamp >= ?`,
+      [fenceId, dayStart]
+    );
+    return row ? row.count : 0;
+  }
+};
+
 module.exports = {
   db,
   FenceModel,
@@ -1792,5 +1926,7 @@ module.exports = {
   OfflineStatsModel,
   FormationModel,
   FormationMemberModel,
-  FormationEventModel
+  FormationEventModel,
+  CapacityConfigModel,
+  CapacityEventModel
 };
