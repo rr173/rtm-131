@@ -22,7 +22,10 @@ const {
   BehaviorProfileModel,
   BehaviorAnomalyModel,
   OfflineEventModel,
-  OfflineStatsModel
+  OfflineStatsModel,
+  FormationModel,
+  FormationMemberModel,
+  FormationEventModel
 } = require('./database');
 const { FenceEngine } = require('./fenceEngine');
 const { WorkOrderEngine } = require('./workOrderEngine');
@@ -34,6 +37,7 @@ const { ReplayManager } = require('./replayManager');
 const { PatrolEngine } = require('./patrolEngine');
 const { BehaviorEngine } = require('./behaviorEngine');
 const { HeartbeatMonitor, STATUS_ONLINE, STATUS_OFFLINE, STATUS_UNKNOWN } = require('./heartbeatMonitor');
+const { FormationEngine } = require('./formationEngine');
 
 const app = express();
 const server = http.createServer(app);
@@ -66,6 +70,7 @@ let workOrderEngine;
 let patrolEngine;
 let behaviorEngine;
 let heartbeatMonitor;
+let formationEngine;
 
 async function main() {
   await initPresetData(FenceModel, POIModel, TargetGroupModel, TargetBindingModel, FenceTimeWindowModel, FenceAlertRuleModel, FenceActionModel, DutyScheduleModel, WorkOrderModel, WorkOrderEscalationModel, AlertModel, PatrolTaskModel);
@@ -120,6 +125,17 @@ async function main() {
   );
   await behaviorEngine.init();
 
+  formationEngine = new FormationEngine(
+    (event) => {
+      broadcast({ type: 'formation_event', data: event });
+    },
+    (update) => {
+      broadcast({ type: 'formation_update', data: update });
+    }
+  );
+  await formationEngine.init();
+  formationEngine.setTargetStatusProvider((targetId) => heartbeatMonitor ? heartbeatMonitor.getTargetStatus(targetId) : STATUS_UNKNOWN);
+
   heartbeatMonitor = new HeartbeatMonitor(
     (offlineEvent) => {
       broadcast({ type: 'target_offline', data: offlineEvent });
@@ -157,6 +173,7 @@ async function main() {
       }
       fenceEngine.processPositionUpdate(position);
       patrolEngine.processPositionUpdate(position);
+      formationEngine.processPositionUpdate(position);
       behaviorEngine.processPositionUpdate(position).catch(err => {
         console.error('[Behavior] 异常检测处理失败:', err.message);
       });
@@ -215,6 +232,10 @@ async function main() {
     const currentReplay = replayManager.getCurrentReplay();
     if (currentReplay) {
       ws.send(JSON.stringify({ type: 'replay_started', data: currentReplay }));
+    }
+    if (formationEngine) {
+      const allFormations = formationEngine.getAllFormations();
+      ws.send(JSON.stringify({ type: 'formation_list', data: allFormations }));
     }
     ws.on('close', () => {
       clients.delete(ws);
@@ -840,7 +861,9 @@ async function main() {
       heartbeat_default_timeout_seconds: heartbeatMonitor ? Math.round(heartbeatMonitor.defaultTimeoutMs / 1000) : null,
       behavior_profile_count: behaviorProfiles.length,
       today_behavior_anomalies: todayAnomalies.length,
-      behavior_hourly_update_running: behaviorEngine ? behaviorEngine.hourlyTimer !== null : false
+      behavior_hourly_update_running: behaviorEngine ? behaviorEngine.hourlyTimer !== null : false,
+      formation_count: formationEngine ? formationEngine.getAllFormations().length : 0,
+      formation_monitoring_count: formationEngine ? formationEngine.getAllFormations().filter(f => f.status === 'monitoring').length : 0
     });
   });
 
@@ -1563,6 +1586,189 @@ async function main() {
     }
   });
 
+  app.get('/api/formations', (req, res) => {
+    try {
+      const formations = formationEngine.getAllFormations();
+      res.json(formations);
+    } catch (err) {
+      console.error('[API] 获取编队列表失败:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.get('/api/formations/:id', (req, res) => {
+    try {
+      const { id } = req.params;
+      const detail = formationEngine.getFormationDetail(parseInt(id));
+      if (!detail) return res.status(404).json({ error: '编队不存在' });
+      res.json(detail);
+    } catch (err) {
+      console.error('[API] 获取编队详情失败:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.post('/api/formations', async (req, res) => {
+    try {
+      const { name, target_ids, radius_threshold, activate, route_fence_ids } = req.body;
+      if (!name) return res.status(400).json({ error: '编队名称是必填项' });
+      if (!Array.isArray(target_ids) || target_ids.length < 2) {
+        return res.status(400).json({ error: '至少需要选择2个目标' });
+      }
+      const result = await formationEngine.createFormation({
+        name,
+        target_ids,
+        radius_threshold: radius_threshold || 0.01,
+        activate: activate !== false,
+        route_fence_ids
+      });
+      res.status(201).json(result);
+    } catch (err) {
+      console.error('[API] 创建编队失败:', err);
+      if (err.message.includes('已存在') || err.message.includes('已在编队')) {
+        res.status(409).json({ error: err.message });
+      } else {
+        res.status(400).json({ error: err.message });
+      }
+    }
+  });
+
+  app.put('/api/formations/:id/activate', async (req, res) => {
+    try {
+      const { id } = req.params;
+      const result = await formationEngine.activateFormation(parseInt(id));
+      res.json(result);
+    } catch (err) {
+      console.error('[API] 激活编队失败:', err);
+      res.status(400).json({ error: err.message });
+    }
+  });
+
+  app.put('/api/formations/:id/deactivate', async (req, res) => {
+    try {
+      const { id } = req.params;
+      const result = await formationEngine.deactivateFormation(parseInt(id));
+      res.json(result);
+    } catch (err) {
+      console.error('[API] 停用编队失败:', err);
+      res.status(400).json({ error: err.message });
+    }
+  });
+
+  app.put('/api/formations/:id/dissolve', async (req, res) => {
+    try {
+      const { id } = req.params;
+      const result = await formationEngine.dissolveFormation(parseInt(id));
+      res.json(result);
+    } catch (err) {
+      console.error('[API] 解散编队失败:', err);
+      res.status(400).json({ error: err.message });
+    }
+  });
+
+  app.delete('/api/formations/:id', async (req, res) => {
+    try {
+      const { id } = req.params;
+      const result = await formationEngine.deleteFormation(parseInt(id));
+      res.json(result);
+    } catch (err) {
+      console.error('[API] 删除编队失败:', err);
+      res.status(400).json({ error: err.message });
+    }
+  });
+
+  app.post('/api/formations/:id/members', async (req, res) => {
+    try {
+      const { id } = req.params;
+      const { target_id, target_name } = req.body;
+      if (!target_id) return res.status(400).json({ error: '需要指定target_id' });
+      const result = await formationEngine.addMember(parseInt(id), target_id, target_name);
+      res.json(result);
+    } catch (err) {
+      console.error('[API] 添加编队成员失败:', err);
+      if (err.message.includes('已在编队')) {
+        res.status(409).json({ error: err.message });
+      } else {
+        res.status(400).json({ error: err.message });
+      }
+    }
+  });
+
+  app.delete('/api/formations/:id/members/:target_id', async (req, res) => {
+    try {
+      const { id, target_id } = req.params;
+      const result = await formationEngine.removeMember(parseInt(id), target_id);
+      res.json(result);
+    } catch (err) {
+      console.error('[API] 移除编队成员失败:', err);
+      res.status(400).json({ error: err.message });
+    }
+  });
+
+  app.put('/api/formations/:id/route', async (req, res) => {
+    try {
+      const { id } = req.params;
+      const { fence_ids } = req.body;
+      if (!Array.isArray(fence_ids) || fence_ids.length === 0) {
+        return res.status(400).json({ error: '路线围栏列表不能为空' });
+      }
+      const result = await formationEngine.setRoute(parseInt(id), fence_ids);
+      res.json(result);
+    } catch (err) {
+      console.error('[API] 设置编队路线失败:', err);
+      res.status(400).json({ error: err.message });
+    }
+  });
+
+  app.get('/api/formations/:id/stats', async (req, res) => {
+    try {
+      const { id } = req.params;
+      const stats = await formationEngine.getFormationStats(parseInt(id));
+      if (!stats) return res.status(404).json({ error: '编队不存在' });
+      res.json(stats);
+    } catch (err) {
+      console.error('[API] 获取编队统计失败:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.get('/api/formations/:id/events', async (req, res) => {
+    try {
+      const { id } = req.params;
+      const { event_type, start_time, end_time, limit, offset } = req.query;
+      const events = await formationEngine.getFormationEvents(parseInt(id), {
+        event_type,
+        start_time: start_time ? parseInt(start_time) : undefined,
+        end_time: end_time ? parseInt(end_time) : undefined,
+        limit: limit ? parseInt(limit) : 100,
+        offset: offset ? parseInt(offset) : 0
+      });
+      res.json({ formation_id: parseInt(id), count: events.length, events });
+    } catch (err) {
+      console.error('[API] 获取编队事件失败:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.get('/api/formation-events', async (req, res) => {
+    try {
+      const { formation_id, target_id, event_type, start_time, end_time, limit, offset } = req.query;
+      const events = await FormationEventModel.query({
+        formation_id: formation_id ? parseInt(formation_id) : undefined,
+        target_id,
+        event_type,
+        start_time: start_time ? parseInt(start_time) : undefined,
+        end_time: end_time ? parseInt(end_time) : undefined,
+        limit: limit ? parseInt(limit) : 100,
+        offset: offset ? parseInt(offset) : 0
+      });
+      res.json({ count: events.length, events });
+    } catch (err) {
+      console.error('[API] 查询编队事件失败:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   const PORT = process.env.PORT || 3000;
 
   server.listen(PORT, async () => {
@@ -1588,6 +1794,24 @@ async function main() {
       await behaviorEngine.initPresetAnomalies();
     } catch (err) {
       console.error('[Behavior] 预置异常事件失败:', err.message);
+    }
+
+    console.log('[Formation] 正在创建预置编队...');
+    try {
+      const existingFormations = formationEngine.getAllFormations();
+      if (existingFormations.length === 0) {
+        await formationEngine.createFormation({
+          name: 'Alpha编队',
+          target_ids: ['T001', 'T002'],
+          radius_threshold: 0.015,
+          activate: true
+        });
+        console.log('[Formation] 已创建预置编队: Alpha编队(T001+T002, 半径0.015, 监控中)');
+      } else {
+        console.log(`[Formation] 已有 ${existingFormations.length} 个编队，跳过预置`);
+      }
+    } catch (err) {
+      console.error('[Formation] 创建预置编队失败:', err.message);
     }
 
     gpsSimulator.start();

@@ -329,6 +329,58 @@ db.serialize(() => {
   db.run(`CREATE INDEX IF NOT EXISTS idx_offline_events_target_time ON offline_events(target_id, offline_start_at)`);
 
   db.run(`
+    CREATE TABLE IF NOT EXISTS formations (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      radius_threshold REAL NOT NULL DEFAULT 0.01,
+      status TEXT NOT NULL CHECK(status IN ('inactive', 'monitoring', 'dissolved')) DEFAULT 'inactive',
+      route_fence_ids TEXT,
+      route_progress TEXT,
+      created_at INTEGER NOT NULL,
+      activated_at INTEGER,
+      dissolved_at INTEGER,
+      updated_at INTEGER NOT NULL
+    )
+  `);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_formations_status ON formations(status)`);
+
+  db.run(`
+    CREATE TABLE IF NOT EXISTS formation_members (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      formation_id INTEGER NOT NULL,
+      target_id TEXT NOT NULL,
+      target_name TEXT,
+      joined_at INTEGER NOT NULL,
+      FOREIGN KEY (formation_id) REFERENCES formations(id) ON DELETE CASCADE,
+      UNIQUE(target_id)
+    )
+  `);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_fm_formation ON formation_members(formation_id)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_fm_target ON formation_members(target_id)`);
+
+  db.run(`
+    CREATE TABLE IF NOT EXISTS formation_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      formation_id INTEGER NOT NULL,
+      formation_name TEXT NOT NULL,
+      target_id TEXT NOT NULL,
+      target_name TEXT,
+      event_type TEXT NOT NULL CHECK(event_type IN ('detached', 'returned')),
+      center_lng REAL NOT NULL,
+      center_lat REAL NOT NULL,
+      member_lng REAL NOT NULL,
+      member_lat REAL NOT NULL,
+      deviation REAL NOT NULL,
+      timestamp INTEGER NOT NULL,
+      created_at INTEGER NOT NULL
+    )
+  `);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_fe_formation ON formation_events(formation_id)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_fe_target ON formation_events(target_id)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_fe_type ON formation_events(event_type)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_fe_timestamp ON formation_events(timestamp)`);
+
+  db.run(`
     CREATE TABLE IF NOT EXISTS target_offline_stats (
       target_id TEXT PRIMARY KEY,
       total_offline_count INTEGER NOT NULL DEFAULT 0,
@@ -1539,6 +1591,184 @@ const OfflineStatsModel = {
   }
 };
 
+const FormationModel = {
+  async create({ name, radius_threshold, status, route_fence_ids }) {
+    const now = Date.now();
+    const result = await run(
+      `INSERT INTO formations (name, radius_threshold, status, route_fence_ids, route_progress, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [name, radius_threshold || 0.01, status || 'inactive',
+       route_fence_ids ? JSON.stringify(route_fence_ids) : null,
+       route_fence_ids ? JSON.stringify(route_fence_ids.map(() => false)) : null,
+       now, now]
+    );
+    return this.getById(result.lastID);
+  },
+
+  async getById(id) {
+    const row = await get('SELECT * FROM formations WHERE id = ?', [id]);
+    if (!row) return null;
+    return this._parseRow(row);
+  },
+
+  async getAll() {
+    const rows = await all('SELECT * FROM formations ORDER BY created_at DESC');
+    return rows.map(row => this._parseRow(row));
+  },
+
+  async getByStatus(status) {
+    const rows = await all('SELECT * FROM formations WHERE status = ? ORDER BY created_at DESC', [status]);
+    return rows.map(row => this._parseRow(row));
+  },
+
+  async getByName(name) {
+    const row = await get('SELECT * FROM formations WHERE name = ?', [name]);
+    if (!row) return null;
+    return this._parseRow(row);
+  },
+
+  async update(id, fields) {
+    const existing = await this.getById(id);
+    if (!existing) return null;
+    const keys = Object.keys(fields);
+    if (keys.length === 0) return existing;
+    const setClause = keys.map(k => {
+      if (k === 'route_fence_ids' || k === 'route_progress') return `${k} = ?`;
+      return `${k} = ?`;
+    }).join(', ');
+    const values = keys.map(k => {
+      if (k === 'route_fence_ids' && fields[k]) return JSON.stringify(fields[k]);
+      if (k === 'route_progress' && fields[k]) return JSON.stringify(fields[k]);
+      return fields[k];
+    });
+    values.push(Date.now());
+    values.push(id);
+    await run(`UPDATE formations SET ${setClause}, updated_at = ? WHERE id = ?`, values);
+    return this.getById(id);
+  },
+
+  async delete(id) {
+    await run('DELETE FROM formations WHERE id = ?', [id]);
+    return true;
+  },
+
+  _parseRow(row) {
+    return {
+      ...row,
+      route_fence_ids: row.route_fence_ids ? JSON.parse(row.route_fence_ids) : null,
+      route_progress: row.route_progress ? JSON.parse(row.route_progress) : null
+    };
+  }
+};
+
+const FormationMemberModel = {
+  async create({ formation_id, target_id, target_name }) {
+    const now = Date.now();
+    const result = await run(
+      'INSERT INTO formation_members (formation_id, target_id, target_name, joined_at) VALUES (?, ?, ?, ?)',
+      [formation_id, target_id, target_name || null, now]
+    );
+    return this.getById(result.lastID);
+  },
+
+  async getById(id) {
+    return get('SELECT * FROM formation_members WHERE id = ?', [id]);
+  },
+
+  async getByFormationId(formation_id) {
+    return all('SELECT * FROM formation_members WHERE formation_id = ?', [formation_id]);
+  },
+
+  async getByTargetId(target_id) {
+    return get('SELECT * FROM formation_members WHERE target_id = ?', [target_id]);
+  },
+
+  async deleteByFormationId(formation_id) {
+    await run('DELETE FROM formation_members WHERE formation_id = ?', [formation_id]);
+    return true;
+  },
+
+  async deleteById(id) {
+    await run('DELETE FROM formation_members WHERE id = ?', [id]);
+    return true;
+  },
+
+  async deleteByTargetId(target_id) {
+    await run('DELETE FROM formation_members WHERE target_id = ?', [target_id]);
+    return true;
+  },
+
+  async batchCreate(formation_id, members) {
+    const now = Date.now();
+    for (const m of members) {
+      await run(
+        'INSERT OR IGNORE INTO formation_members (formation_id, target_id, target_name, joined_at) VALUES (?, ?, ?, ?)',
+        [formation_id, m.target_id, m.target_name || null, now]
+      );
+    }
+    return this.getByFormationId(formation_id);
+  }
+};
+
+const FormationEventModel = {
+  async create({ formation_id, formation_name, target_id, target_name, event_type, center_lng, center_lat, member_lng, member_lat, deviation, timestamp }) {
+    const now = Date.now();
+    const result = await run(
+      `INSERT INTO formation_events
+        (formation_id, formation_name, target_id, target_name, event_type, center_lng, center_lat, member_lng, member_lat, deviation, timestamp, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [formation_id, formation_name, target_id, target_name || null, event_type,
+       center_lng, center_lat, member_lng, member_lat, deviation, timestamp, now]
+    );
+    return this.getById(result.lastID);
+  },
+
+  async getById(id) {
+    return get('SELECT * FROM formation_events WHERE id = ?', [id]);
+  },
+
+  async query({ formation_id, target_id, event_type, start_time, end_time, limit = 100, offset = 0 } = {}) {
+    let sql = 'SELECT * FROM formation_events WHERE 1=1';
+    const params = [];
+    if (formation_id) { sql += ' AND formation_id = ?'; params.push(formation_id); }
+    if (target_id) { sql += ' AND target_id = ?'; params.push(target_id); }
+    if (event_type) { sql += ' AND event_type = ?'; params.push(event_type); }
+    if (start_time) { sql += ' AND timestamp >= ?'; params.push(start_time); }
+    if (end_time) { sql += ' AND timestamp <= ?'; params.push(end_time); }
+    sql += ' ORDER BY timestamp DESC LIMIT ? OFFSET ?';
+    params.push(limit, offset);
+    return all(sql, params);
+  },
+
+  async getByFormationId(formation_id, limit = 100) {
+    return all('SELECT * FROM formation_events WHERE formation_id = ? ORDER BY timestamp DESC LIMIT ?', [formation_id, limit]);
+  },
+
+  async countByFormation(formation_id) {
+    const row = await get('SELECT COUNT(*) as count FROM formation_events WHERE formation_id = ?', [formation_id]);
+    return row ? row.count : 0;
+  },
+
+  async getDetachStats(formation_id) {
+    const rows = await all(`
+      SELECT target_id, target_name, COUNT(*) as detach_count
+      FROM formation_events
+      WHERE formation_id = ? AND event_type = 'detached'
+      GROUP BY target_id, target_name
+      ORDER BY detach_count DESC
+    `, [formation_id]);
+    return rows;
+  },
+
+  async getTotalDetachCount(formation_id) {
+    const row = await get(`
+      SELECT COUNT(*) as count FROM formation_events
+      WHERE formation_id = ? AND event_type = 'detached'
+    `, [formation_id]);
+    return row ? row.count : 0;
+  }
+};
+
 module.exports = {
   db,
   FenceModel,
@@ -1559,5 +1789,8 @@ module.exports = {
   BehaviorProfileModel,
   BehaviorAnomalyModel,
   OfflineEventModel,
-  OfflineStatsModel
+  OfflineStatsModel,
+  FormationModel,
+  FormationMemberModel,
+  FormationEventModel
 };
