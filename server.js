@@ -27,7 +27,9 @@ const {
   FormationMemberModel,
   FormationEventModel,
   CapacityConfigModel,
-  CapacityEventModel
+  CapacityEventModel,
+  ProximityThresholdConfigModel,
+  ProximityEventModel
 } = require('./database');
 const { FenceEngine } = require('./fenceEngine');
 const { WorkOrderEngine } = require('./workOrderEngine');
@@ -41,6 +43,7 @@ const { BehaviorEngine } = require('./behaviorEngine');
 const { HeartbeatMonitor, STATUS_ONLINE, STATUS_OFFLINE, STATUS_UNKNOWN } = require('./heartbeatMonitor');
 const { FormationEngine } = require('./formationEngine');
 const { CapacityManager } = require('./capacityManager');
+const { ProximityEngine } = require('./proximityEngine');
 
 const app = express();
 const server = http.createServer(app);
@@ -75,9 +78,10 @@ let behaviorEngine;
 let heartbeatMonitor;
 let formationEngine;
 let capacityManager;
+let proximityEngine;
 
 async function main() {
-  await initPresetData(FenceModel, POIModel, TargetGroupModel, TargetBindingModel, FenceTimeWindowModel, FenceAlertRuleModel, FenceActionModel, DutyScheduleModel, WorkOrderModel, WorkOrderEscalationModel, AlertModel, PatrolTaskModel, CapacityConfigModel);
+  await initPresetData(FenceModel, POIModel, TargetGroupModel, TargetBindingModel, FenceTimeWindowModel, FenceAlertRuleModel, FenceActionModel, DutyScheduleModel, WorkOrderModel, WorkOrderEscalationModel, AlertModel, PatrolTaskModel, CapacityConfigModel, ProximityThresholdConfigModel);
 
   workOrderEngine = new WorkOrderEngine((update) => {
     broadcast({
@@ -114,6 +118,21 @@ async function main() {
   });
   await capacityManager.loadConfigs();
   fenceEngine.setCapacityManager(capacityManager);
+
+  proximityEngine = new ProximityEngine(
+    (event) => {
+      broadcast({ type: 'proximity_event', data: event });
+    },
+    (event) => {
+      broadcast({ type: 'proximity_leave', data: event });
+    },
+    (pairs) => {
+      broadcast({ type: 'proximity_status', data: pairs });
+    }
+  );
+  await proximityEngine.init();
+  proximityEngine.setFenceEngine(fenceEngine);
+  proximityEngine.setTargetStatusProvider((targetId) => heartbeatMonitor ? heartbeatMonitor.getTargetStatus(targetId) : STATUS_UNKNOWN);
 
   replayManager = new ReplayManager(
     broadcast,
@@ -187,6 +206,11 @@ async function main() {
       behaviorEngine.processPositionUpdate(position).catch(err => {
         console.error('[Behavior] 异常检测处理失败:', err.message);
       });
+      if (proximityEngine) {
+        proximityEngine.processPositionUpdate(position).catch(err => {
+          console.error('[Proximity] 接近检测处理失败:', err.message);
+        });
+      }
       const binding = await TargetBindingModel.getBinding(position.id);
       const posWithGroup = {
         ...position,
@@ -250,6 +274,10 @@ async function main() {
     if (capacityManager) {
       const capacitySummaries = await capacityManager.getAllCapacitySummaries();
       ws.send(JSON.stringify({ type: 'capacity_summaries', data: capacitySummaries }));
+    }
+    if (proximityEngine) {
+      const activePairs = proximityEngine.getAllActivePairs();
+      ws.send(JSON.stringify({ type: 'proximity_status', data: activePairs }));
     }
     ws.on('close', () => {
       clients.delete(ws);
@@ -1950,6 +1978,157 @@ async function main() {
       });
     } catch (err) {
       console.error('[API] 获取容量统计失败:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.get('/api/proximity/threshold', async (req, res) => {
+    try {
+      const globalCfg = await ProximityThresholdConfigModel.getGlobalConfig();
+      const pairCfgs = await ProximityThresholdConfigModel.getAllGroupPairConfigs();
+      const result = {
+        global_threshold: globalCfg ? globalCfg.threshold : 0.005,
+        group_pair_thresholds: pairCfgs
+      };
+      res.json(result);
+    } catch (err) {
+      console.error('[API] 获取接近阈值配置失败:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.put('/api/proximity/threshold/global', async (req, res) => {
+    try {
+      const { threshold } = req.body;
+      if (threshold === undefined || threshold === null) {
+        return res.status(400).json({ error: '需要指定 threshold' });
+      }
+      const t = parseFloat(threshold);
+      if (isNaN(t) || t <= 0) {
+        return res.status(400).json({ error: 'threshold 必须是正数' });
+      }
+      const cfg = await ProximityThresholdConfigModel.setGlobalThreshold(t);
+      if (proximityEngine) {
+        proximityEngine.globalThreshold = t;
+      }
+      res.json(cfg);
+    } catch (err) {
+      console.error('[API] 设置全局接近阈值失败:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.post('/api/proximity/threshold/group-pair', async (req, res) => {
+    try {
+      const { group_id_a, group_id_b, threshold } = req.body;
+      if (group_id_a === undefined || group_id_b === undefined || threshold === undefined) {
+        return res.status(400).json({ error: '需要指定 group_id_a、group_id_b 和 threshold' });
+      }
+      const t = parseFloat(threshold);
+      if (isNaN(t) || t <= 0) {
+        return res.status(400).json({ error: 'threshold 必须是正数' });
+      }
+      const cfg = await ProximityThresholdConfigModel.setGroupPairThreshold(
+        parseInt(group_id_a), parseInt(group_id_b), t
+      );
+      if (proximityEngine) {
+        const key = proximityEngine._pairKey(parseInt(group_id_a), parseInt(group_id_b));
+        proximityEngine.groupPairThresholds.set(key, t);
+      }
+      res.status(201).json(cfg);
+    } catch (err) {
+      console.error('[API] 设置分组对接近阈值失败:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.delete('/api/proximity/threshold/group-pair/:group_id_a/:group_id_b', async (req, res) => {
+    try {
+      const { group_id_a, group_id_b } = req.params;
+      await ProximityThresholdConfigModel.deleteGroupPairThreshold(
+        parseInt(group_id_a), parseInt(group_id_b)
+      );
+      if (proximityEngine) {
+        const key = proximityEngine._pairKey(parseInt(group_id_a), parseInt(group_id_b));
+        proximityEngine.groupPairThresholds.delete(key);
+      }
+      res.json({ success: true });
+    } catch (err) {
+      console.error('[API] 删除分组对接近阈值失败:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.get('/api/proximity/active', (req, res) => {
+    try {
+      if (!proximityEngine) return res.json({ count: 0, pairs: [] });
+      const pairs = proximityEngine.getAllActivePairs();
+      res.json({ count: pairs.length, pairs });
+    } catch (err) {
+      console.error('[API] 获取当前接近目标对失败:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.get('/api/proximity/events', async (req, res) => {
+    try {
+      const { target_id, group_id, fence_id, is_confrontation, level, start_time, end_time, limit, offset } = req.query;
+      const events = await ProximityEventModel.query({
+        target_id,
+        group_id: group_id !== undefined && group_id !== '' ? parseInt(group_id) : undefined,
+        fence_id: fence_id !== undefined && fence_id !== '' ? parseInt(fence_id) : undefined,
+        is_confrontation: is_confrontation !== undefined && is_confrontation !== '' ? (is_confrontation === 'true' || is_confrontation === '1') : undefined,
+        level,
+        start_time: start_time ? parseInt(start_time) : undefined,
+        end_time: end_time ? parseInt(end_time) : undefined,
+        limit: limit ? parseInt(limit) : 100,
+        offset: offset ? parseInt(offset) : 0
+      });
+      res.json({ count: events.length, events });
+    } catch (err) {
+      console.error('[API] 查询接近事件失败:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.get('/api/proximity/events/:id', async (req, res) => {
+    try {
+      const { id } = req.params;
+      const event = await ProximityEventModel.getById(parseInt(id));
+      if (!event) return res.status(404).json({ error: '事件不存在' });
+      res.json(event);
+    } catch (err) {
+      console.error('[API] 获取接近事件详情失败:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.get('/api/proximity/stats/top-confrontation-pairs', async (req, res) => {
+    try {
+      const { fence_id, start_time, end_time, limit } = req.query;
+      const pairs = await ProximityEventModel.getTopConfrontationPairsByFence(
+        fence_id !== undefined && fence_id !== '' ? parseInt(fence_id) : undefined,
+        limit ? parseInt(limit) : 5,
+        start_time ? parseInt(start_time) : undefined,
+        end_time ? parseInt(end_time) : undefined
+      );
+      res.json({ count: pairs.length, pairs });
+    } catch (err) {
+      console.error('[API] 获取对峙事件TOP目标对失败:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.get('/api/proximity/stats/group-frequency-matrix', async (req, res) => {
+    try {
+      const { start_time, end_time } = req.query;
+      const matrix = await ProximityEventModel.getGroupFrequencyMatrix(
+        start_time ? parseInt(start_time) : undefined,
+        end_time ? parseInt(end_time) : undefined
+      );
+      res.json({ count: matrix.length, matrix });
+    } catch (err) {
+      console.error('[API] 获取分组接近频率矩阵失败:', err);
       res.status(500).json({ error: err.message });
     }
   });

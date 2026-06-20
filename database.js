@@ -428,6 +428,58 @@ db.serialize(() => {
   db.run(`CREATE INDEX IF NOT EXISTS idx_cap_evt_type ON capacity_events(event_type)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_cap_evt_time ON capacity_events(timestamp)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_cap_evt_fence_time ON capacity_events(fence_id, timestamp)`);
+
+  db.run(`
+    CREATE TABLE IF NOT EXISTS proximity_threshold_config (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      config_type TEXT NOT NULL CHECK(config_type IN ('global', 'group_pair')),
+      group_id_a INTEGER,
+      group_id_b INTEGER,
+      threshold REAL NOT NULL DEFAULT 0.005,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(group_id_a, group_id_b)
+    )
+  `);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_prox_cfg_type ON proximity_threshold_config(config_type)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_prox_cfg_pair ON proximity_threshold_config(group_id_a, group_id_b)`);
+
+  db.run(`
+    CREATE TABLE IF NOT EXISTS proximity_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      target_id_a TEXT NOT NULL,
+      target_name_a TEXT,
+      target_id_b TEXT NOT NULL,
+      target_name_b TEXT,
+      group_id_a INTEGER,
+      group_name_a TEXT,
+      group_id_b INTEGER,
+      group_name_b TEXT,
+      distance REAL NOT NULL,
+      prev_distance REAL,
+      threshold REAL NOT NULL,
+      is_confrontation INTEGER NOT NULL DEFAULT 0,
+      fence_id INTEGER,
+      fence_name TEXT,
+      fence_type TEXT,
+      level TEXT NOT NULL CHECK(level IN ('info', 'warning', 'critical')) DEFAULT 'info',
+      lng_a REAL NOT NULL,
+      lat_a REAL NOT NULL,
+      lng_b REAL NOT NULL,
+      lat_b REAL NOT NULL,
+      timestamp INTEGER NOT NULL,
+      created_at INTEGER NOT NULL,
+      FOREIGN KEY (fence_id) REFERENCES fences(id) ON DELETE SET NULL
+    )
+  `);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_prox_evt_target_a ON proximity_events(target_id_a)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_prox_evt_target_b ON proximity_events(target_id_b)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_prox_evt_group_a ON proximity_events(group_id_a)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_prox_evt_group_b ON proximity_events(group_id_b)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_prox_evt_fence ON proximity_events(fence_id)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_prox_evt_time ON proximity_events(timestamp)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_prox_evt_conf ON proximity_events(is_confrontation)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_prox_evt_level ON proximity_events(level)`);
 });
 
 function run(sql, params = []) {
@@ -1906,6 +1958,218 @@ const CapacityEventModel = {
   }
 };
 
+const ProximityThresholdConfigModel = {
+  async getGlobalConfig() {
+    const row = await get(
+      "SELECT * FROM proximity_threshold_config WHERE config_type = 'global' LIMIT 1"
+    );
+    return row || null;
+  },
+
+  async setGlobalThreshold(threshold) {
+    const existing = await this.getGlobalConfig();
+    const now = Date.now();
+    if (existing) {
+      await run(
+        "UPDATE proximity_threshold_config SET threshold = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        [threshold, existing.id]
+      );
+      return this.getById(existing.id);
+    } else {
+      const result = await run(
+        "INSERT INTO proximity_threshold_config (config_type, threshold) VALUES ('global', ?)",
+        [threshold]
+      );
+      return this.getById(result.lastID);
+    }
+  },
+
+  async getAllGroupPairConfigs() {
+    return all(
+      "SELECT * FROM proximity_threshold_config WHERE config_type = 'group_pair' ORDER BY id"
+    );
+  },
+
+  async getGroupPairThreshold(groupIdA, groupIdB) {
+    const a = Math.min(groupIdA, groupIdB);
+    const b = Math.max(groupIdA, groupIdB);
+    const row = await get(
+      "SELECT * FROM proximity_threshold_config WHERE config_type = 'group_pair' AND group_id_a = ? AND group_id_b = ?",
+      [a, b]
+    );
+    return row || null;
+  },
+
+  async setGroupPairThreshold(groupIdA, groupIdB, threshold) {
+    const a = Math.min(groupIdA, groupIdB);
+    const b = Math.max(groupIdA, groupIdB);
+    const existing = await this.getGroupPairThreshold(a, b);
+    if (existing) {
+      await run(
+        "UPDATE proximity_threshold_config SET threshold = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        [threshold, existing.id]
+      );
+      return this.getById(existing.id);
+    } else {
+      const result = await run(
+        "INSERT INTO proximity_threshold_config (config_type, group_id_a, group_id_b, threshold) VALUES ('group_pair', ?, ?, ?)",
+        [a, b, threshold]
+      );
+      return this.getById(result.lastID);
+    }
+  },
+
+  async deleteGroupPairThreshold(groupIdA, groupIdB) {
+    const a = Math.min(groupIdA, groupIdB);
+    const b = Math.max(groupIdA, groupIdB);
+    await run(
+      "DELETE FROM proximity_threshold_config WHERE config_type = 'group_pair' AND group_id_a = ? AND group_id_b = ?",
+      [a, b]
+    );
+    return true;
+  },
+
+  async getById(id) {
+    return get('SELECT * FROM proximity_threshold_config WHERE id = ?', [id]);
+  },
+
+  async getAll() {
+    return all('SELECT * FROM proximity_threshold_config ORDER BY id');
+  }
+};
+
+const ProximityEventModel = {
+  async create(data) {
+    const now = Date.now();
+    const result = await run(
+      `INSERT INTO proximity_events (
+        target_id_a, target_name_a, target_id_b, target_name_b,
+        group_id_a, group_name_a, group_id_b, group_name_b,
+        distance, prev_distance, threshold,
+        is_confrontation, fence_id, fence_name, fence_type, level,
+        lng_a, lat_a, lng_b, lat_b, timestamp, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        data.target_id_a, data.target_name_a || null,
+        data.target_id_b, data.target_name_b || null,
+        data.group_id_a !== undefined ? data.group_id_a : null,
+        data.group_name_a || null,
+        data.group_id_b !== undefined ? data.group_id_b : null,
+        data.group_name_b || null,
+        data.distance, data.prev_distance !== undefined ? data.prev_distance : null,
+        data.threshold,
+        data.is_confrontation ? 1 : 0,
+        data.fence_id !== undefined ? data.fence_id : null,
+        data.fence_name || null,
+        data.fence_type || null,
+        data.level || 'info',
+        data.lng_a, data.lat_a, data.lng_b, data.lat_b,
+        data.timestamp || now, now
+      ]
+    );
+    return this.getById(result.lastID);
+  },
+
+  async getById(id) {
+    const row = await get('SELECT * FROM proximity_events WHERE id = ?', [id]);
+    if (!row) return null;
+    return this._parseRow(row);
+  },
+
+  async query({ target_id, group_id, fence_id, is_confrontation, level, start_time, end_time, limit = 100, offset = 0 } = {}) {
+    let sql = 'SELECT * FROM proximity_events WHERE 1=1';
+    const params = [];
+    if (target_id) {
+      sql += ' AND (target_id_a = ? OR target_id_b = ?)';
+      params.push(target_id, target_id);
+    }
+    if (group_id !== undefined && group_id !== null) {
+      sql += ' AND (group_id_a = ? OR group_id_b = ?)';
+      params.push(group_id, group_id);
+    }
+    if (fence_id !== undefined && fence_id !== null) {
+      sql += ' AND fence_id = ?';
+      params.push(fence_id);
+    }
+    if (is_confrontation !== undefined && is_confrontation !== null) {
+      sql += ' AND is_confrontation = ?';
+      params.push(is_confrontation ? 1 : 0);
+    }
+    if (level) {
+      sql += ' AND level = ?';
+      params.push(level);
+    }
+    if (start_time) {
+      sql += ' AND timestamp >= ?';
+      params.push(start_time);
+    }
+    if (end_time) {
+      sql += ' AND timestamp <= ?';
+      params.push(end_time);
+    }
+    sql += ' ORDER BY timestamp DESC LIMIT ? OFFSET ?';
+    params.push(limit, offset);
+    const rows = await all(sql, params);
+    return rows.map(row => this._parseRow(row));
+  },
+
+  async getTopConfrontationPairsByFence(fenceId, limit = 5, start_time, end_time) {
+    let sql = `
+      SELECT 
+        target_id_a, target_name_a, target_id_b, target_name_b,
+        group_id_a, group_name_a, group_id_b, group_name_b,
+        COUNT(*) as confrontation_count
+      FROM proximity_events
+      WHERE is_confrontation = 1
+    `;
+    const params = [];
+    if (fenceId !== undefined && fenceId !== null) {
+      sql += ' AND fence_id = ?';
+      params.push(fenceId);
+    }
+    if (start_time) {
+      sql += ' AND timestamp >= ?';
+      params.push(start_time);
+    }
+    if (end_time) {
+      sql += ' AND timestamp <= ?';
+      params.push(end_time);
+    }
+    sql += ' GROUP BY target_id_a, target_id_b ORDER BY confrontation_count DESC LIMIT ?';
+    params.push(limit);
+    return all(sql, params);
+  },
+
+  async getGroupFrequencyMatrix(start_time, end_time) {
+    let sql = `
+      SELECT 
+        group_id_a, group_name_a, group_id_b, group_name_b,
+        COUNT(*) as proximity_count,
+        SUM(CASE WHEN is_confrontation = 1 THEN 1 ELSE 0 END) as confrontation_count
+      FROM proximity_events
+      WHERE 1=1
+    `;
+    const params = [];
+    if (start_time) {
+      sql += ' AND timestamp >= ?';
+      params.push(start_time);
+    }
+    if (end_time) {
+      sql += ' AND timestamp <= ?';
+      params.push(end_time);
+    }
+    sql += ' GROUP BY group_id_a, group_id_b ORDER BY proximity_count DESC';
+    return all(sql, params);
+  },
+
+  _parseRow(row) {
+    return {
+      ...row,
+      is_confrontation: row.is_confrontation === 1
+    };
+  }
+};
+
 module.exports = {
   db,
   FenceModel,
@@ -1931,5 +2195,7 @@ module.exports = {
   FormationMemberModel,
   FormationEventModel,
   CapacityConfigModel,
-  CapacityEventModel
+  CapacityEventModel,
+  ProximityThresholdConfigModel,
+  ProximityEventModel
 };

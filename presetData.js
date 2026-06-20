@@ -62,7 +62,7 @@ const presetBindings = [
 const weekdayTimeSlots = [{ weekdays: [1, 2, 3, 4, 5], start_time: '08:00', end_time: '18:00' }];
 const allDayTimeSlots = [{ weekdays: [0, 1, 2, 3, 4, 5, 6], start_time: '00:00', end_time: '23:59' }];
 
-async function initPresetData(FenceModel, POIModel, TargetGroupModel, TargetBindingModel, FenceTimeWindowModel, FenceAlertRuleModel, FenceActionModel, DutyScheduleModel, WorkOrderModel, WorkOrderEscalationModel, AlertModel, PatrolTaskModel, CapacityConfigModel) {
+async function initPresetData(FenceModel, POIModel, TargetGroupModel, TargetBindingModel, FenceTimeWindowModel, FenceAlertRuleModel, FenceActionModel, DutyScheduleModel, WorkOrderModel, WorkOrderEscalationModel, AlertModel, PatrolTaskModel, CapacityConfigModel, ProximityThresholdConfigModel) {
   const existingFences = await FenceModel.getAll();
   let fenceMap = new Map();
   if (existingFences.length === 0) {
@@ -438,6 +438,24 @@ async function initPresetData(FenceModel, POIModel, TargetGroupModel, TargetBind
         });
 
         console.log('[Preset] 已创建1个待激活巡检任务（60秒后激活，T001按顺序巡禁入区、普通区、禁出区）');
+      }
+    }
+  }
+
+  if (ProximityThresholdConfigModel) {
+    const existingGlobalCfg = await ProximityThresholdConfigModel.getGlobalConfig();
+    if (!existingGlobalCfg) {
+      await ProximityThresholdConfigModel.setGlobalThreshold(0.005);
+      console.log('[Preset] 已设置全局接近阈值: 0.005');
+    }
+
+    const freightGroup = groupMap.get('货运车队');
+    const vipGroup = groupMap.get('VIP车辆');
+    if (freightGroup && vipGroup) {
+      const existingPairCfg = await ProximityThresholdConfigModel.getGroupPairThreshold(freightGroup.id, vipGroup.id);
+      if (!existingPairCfg) {
+        await ProximityThresholdConfigModel.setGroupPairThreshold(freightGroup.id, vipGroup.id, 0.003);
+        console.log(`[Preset] 已设置货运车队(VIP车辆)接近阈值: 0.003`);
       }
     }
   }
