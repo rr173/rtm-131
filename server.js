@@ -20,7 +20,9 @@ const {
   WorkOrderEscalationModel,
   PatrolTaskModel,
   BehaviorProfileModel,
-  BehaviorAnomalyModel
+  BehaviorAnomalyModel,
+  OfflineEventModel,
+  OfflineStatsModel
 } = require('./database');
 const { FenceEngine } = require('./fenceEngine');
 const { WorkOrderEngine } = require('./workOrderEngine');
@@ -31,6 +33,7 @@ const { HeatmapManager } = require('./heatmapManager');
 const { ReplayManager } = require('./replayManager');
 const { PatrolEngine } = require('./patrolEngine');
 const { BehaviorEngine } = require('./behaviorEngine');
+const { HeartbeatMonitor, STATUS_ONLINE, STATUS_OFFLINE, STATUS_UNKNOWN } = require('./heartbeatMonitor');
 
 const app = express();
 const server = http.createServer(app);
@@ -62,6 +65,7 @@ let replayManager;
 let workOrderEngine;
 let patrolEngine;
 let behaviorEngine;
+let heartbeatMonitor;
 
 async function main() {
   await initPresetData(FenceModel, POIModel, TargetGroupModel, TargetBindingModel, FenceTimeWindowModel, FenceAlertRuleModel, FenceActionModel, DutyScheduleModel, WorkOrderModel, WorkOrderEscalationModel, AlertModel, PatrolTaskModel);
@@ -116,8 +120,41 @@ async function main() {
   );
   await behaviorEngine.init();
 
+  heartbeatMonitor = new HeartbeatMonitor(
+    (offlineEvent) => {
+      broadcast({ type: 'target_offline', data: offlineEvent });
+    },
+    (recoverEvent) => {
+      broadcast({ type: 'target_recover', data: recoverEvent });
+    },
+    (statusChange) => {
+      broadcast({ type: 'target_status_change', data: statusChange });
+      if (patrolEngine) {
+        try {
+          patrolEngine.handleTargetStatusChange(
+            statusChange.target_id,
+            statusChange.old_status,
+            statusChange.new_status
+          );
+        } catch (err) {
+          console.error('[Server] 通知巡检引擎状态变更失败:', err.message);
+        }
+      }
+    }
+  );
+  await heartbeatMonitor.init();
+
+  heartbeatMonitor.setDefaultTimeout(30 * 1000);
+  heartbeatMonitor.setTargetTimeout('T003', 10 * 1000);
+
+  workOrderEngine.setTargetStatusProvider((targetId) => heartbeatMonitor.getTargetStatus(targetId));
+  patrolEngine.setTargetStatusProvider((targetId) => heartbeatMonitor.getTargetStatus(targetId));
+
   gpsSimulator = new GPSSimulator(async (position) => {
     if (!replayManager.isTargetInReplay(position.id)) {
+      if (heartbeatMonitor) {
+        heartbeatMonitor.recordHeartbeat(position);
+      }
       fenceEngine.processPositionUpdate(position);
       patrolEngine.processPositionUpdate(position);
       behaviorEngine.processPositionUpdate(position).catch(err => {
@@ -128,7 +165,8 @@ async function main() {
         ...position,
         group_id: binding ? binding.group_id : null,
         group_name: binding ? binding.group_name : null,
-        group_color: binding ? binding.group_color : null
+        group_color: binding ? binding.group_color : null,
+        online_status: heartbeatMonitor ? heartbeatMonitor.getTargetStatus(position.id) : STATUS_UNKNOWN
       };
       broadcast({ type: 'position', data: posWithGroup });
     }
@@ -140,6 +178,7 @@ async function main() {
     const targets = gpsSimulator.getAllTargets();
     for (const target of targets) {
       const binding = await TargetBindingModel.getBinding(target.id);
+      const hbState = heartbeatMonitor ? heartbeatMonitor.getTargetState(target.id) : null;
       ws.send(JSON.stringify({
         type: 'position',
         data: {
@@ -153,8 +192,17 @@ async function main() {
           trajectory: target.trajectory,
           group_id: binding ? binding.group_id : null,
           group_name: binding ? binding.group_name : null,
-          group_color: binding ? binding.group_color : null
+          group_color: binding ? binding.group_color : null,
+          online_status: hbState ? hbState.status : STATUS_UNKNOWN,
+          last_report_at: hbState ? hbState.last_report_at : null,
+          timeout_seconds: hbState ? hbState.timeout_seconds : null
         }
+      }));
+    }
+    if (heartbeatMonitor) {
+      ws.send(JSON.stringify({
+        type: 'heartbeat_states',
+        data: heartbeatMonitor.getAllTargetStates()
       }));
     }
     fenceEngine.getAllFenceStatus().forEach(status => {
@@ -470,6 +518,8 @@ async function main() {
     const result = [];
     for (const target of targets) {
       const binding = await TargetBindingModel.getBinding(target.id);
+      const hbState = heartbeatMonitor ? heartbeatMonitor.getTargetState(target.id) : null;
+      const silenced = gpsSimulator.isTargetSilent(target.id);
       result.push({
         id: target.id,
         name: target.name,
@@ -481,7 +531,16 @@ async function main() {
         group_id: binding ? binding.group_id : null,
         group_name: binding ? binding.group_name : null,
         group_color: binding ? binding.group_color : null,
-        bound_at: binding ? binding.bound_at : null
+        bound_at: binding ? binding.bound_at : null,
+        online_status: hbState ? hbState.status : STATUS_UNKNOWN,
+        last_report_at: hbState ? hbState.last_report_at : null,
+        last_report_seconds_ago: hbState ? hbState.last_report_seconds_ago : null,
+        timeout_ms: hbState ? hbState.timeout_ms : null,
+        timeout_seconds: hbState ? hbState.timeout_seconds : null,
+        offline_duration_ms: hbState ? hbState.offline_duration_ms : 0,
+        offline_duration_seconds: hbState ? hbState.offline_duration_seconds : 0,
+        offline_duration_text: hbState ? hbState.offline_duration_text : '0秒',
+        silenced: silenced
       });
     }
     res.json(result);
@@ -526,6 +585,214 @@ async function main() {
     res.json(fenceEngine.getStatistics());
   });
 
+  app.get('/api/heartbeat/states', (req, res) => {
+    try {
+      if (!heartbeatMonitor) return res.json([]);
+      res.json(heartbeatMonitor.getAllTargetStates());
+    } catch (err) {
+      console.error('[API] 获取心跳状态失败:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.get('/api/heartbeat/states/:target_id', (req, res) => {
+    try {
+      const { target_id } = req.params;
+      if (!heartbeatMonitor) return res.status(404).json({ error: '心跳监控未启动' });
+      const state = heartbeatMonitor.getTargetState(target_id);
+      res.json(state);
+    } catch (err) {
+      console.error('[API] 获取目标心跳状态失败:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.put('/api/heartbeat/timeout', async (req, res) => {
+    try {
+      const { target_id, timeout_seconds } = req.body;
+      if (timeout_seconds === undefined || timeout_seconds === null) {
+        return res.status(400).json({ error: '需要指定 timeout_seconds' });
+      }
+      const timeoutMs = parseInt(timeout_seconds) * 1000;
+      if (isNaN(timeoutMs) || timeoutMs < 1000) {
+        return res.status(400).json({ error: 'timeout_seconds 必须是大于等于1的整数' });
+      }
+      if (target_id) {
+        heartbeatMonitor.setTargetTimeout(target_id, timeoutMs);
+        res.json({
+          target_id,
+          timeout_ms: timeoutMs,
+          timeout_seconds: parseInt(timeout_seconds),
+          scope: 'target'
+        });
+      } else {
+        heartbeatMonitor.setDefaultTimeout(timeoutMs);
+        res.json({
+          timeout_ms: timeoutMs,
+          timeout_seconds: parseInt(timeout_seconds),
+          scope: 'global'
+        });
+      }
+    } catch (err) {
+      console.error('[API] 设置超时阈值失败:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.get('/api/heartbeat/timeout/:target_id?', (req, res) => {
+    try {
+      const { target_id } = req.params;
+      if (target_id) {
+        const timeoutMs = heartbeatMonitor.getTargetTimeout(target_id);
+        res.json({
+          target_id,
+          timeout_ms: timeoutMs,
+          timeout_seconds: Math.round(timeoutMs / 1000),
+          is_default: !heartbeatMonitor.targetTimeouts.has(target_id),
+          default_timeout_ms: heartbeatMonitor.defaultTimeoutMs,
+          default_timeout_seconds: Math.round(heartbeatMonitor.defaultTimeoutMs / 1000)
+        });
+      } else {
+        const result = {
+          default_timeout_ms: heartbeatMonitor.defaultTimeoutMs,
+          default_timeout_seconds: Math.round(heartbeatMonitor.defaultTimeoutMs / 1000),
+          per_target: {}
+        };
+        for (const [tid, tms] of heartbeatMonitor.targetTimeouts.entries()) {
+          result.per_target[tid] = {
+            timeout_ms: tms,
+            timeout_seconds: Math.round(tms / 1000)
+          };
+        }
+        res.json(result);
+      }
+    } catch (err) {
+      console.error('[API] 获取超时阈值失败:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.post('/api/targets/:id/silence', (req, res) => {
+    try {
+      const { id } = req.params;
+      const result = gpsSimulator.silenceTarget(id);
+      broadcast({
+        type: 'target_silenced',
+        data: result
+      });
+      res.json(result);
+    } catch (err) {
+      console.error('[API] 静默目标失败:', err.message);
+      if (err.message.includes('不存在')) {
+        res.status(404).json({ error: err.message });
+      } else {
+        res.status(400).json({ error: err.message });
+      }
+    }
+  });
+
+  app.post('/api/targets/:id/resume', (req, res) => {
+    try {
+      const { id } = req.params;
+      const result = gpsSimulator.resumeTarget(id);
+      broadcast({
+        type: 'target_resumed',
+        data: result
+      });
+      res.json(result);
+    } catch (err) {
+      console.error('[API] 恢复目标失败:', err.message);
+      if (err.message.includes('不存在')) {
+        res.status(404).json({ error: err.message });
+      } else {
+        res.status(400).json({ error: err.message });
+      }
+    }
+  });
+
+  app.get('/api/targets/silenced/list', (req, res) => {
+    try {
+      const ids = gpsSimulator.getSilentTargets();
+      res.json({
+        count: ids.length,
+        target_ids: ids
+      });
+    } catch (err) {
+      console.error('[API] 获取静默目标列表失败:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.get('/api/offline-events', async (req, res) => {
+    try {
+      const { target_id, event_type, start_time, end_time, limit, offset } = req.query;
+      const events = await OfflineEventModel.query({
+        target_id,
+        event_type,
+        start_time: start_time ? parseInt(start_time) : undefined,
+        end_time: end_time ? parseInt(end_time) : undefined,
+        limit: limit ? parseInt(limit) : 100,
+        offset: offset ? parseInt(offset) : 0
+      });
+      res.json({
+        count: events.length,
+        events
+      });
+    } catch (err) {
+      console.error('[API] 查询离线事件失败:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.get('/api/offline-events/:target_id', async (req, res) => {
+    try {
+      const { target_id } = req.params;
+      const { limit } = req.query;
+      const events = await OfflineEventModel.getByTarget(
+        target_id,
+        limit ? parseInt(limit) : 100
+      );
+      res.json({
+        target_id,
+        count: events.length,
+        events
+      });
+    } catch (err) {
+      console.error('[API] 查询目标离线事件失败:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.get('/api/offline-stats', (req, res) => {
+    try {
+      if (!heartbeatMonitor) return res.json([]);
+      res.json({
+        count: heartbeatMonitor.getAllStats().length,
+        stats: heartbeatMonitor.getAllStats()
+      });
+    } catch (err) {
+      console.error('[API] 获取离线统计失败:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.get('/api/offline-stats/:target_id', async (req, res) => {
+    try {
+      const { target_id } = req.params;
+      if (!heartbeatMonitor) return res.status(404).json({ error: '心跳监控未启动' });
+      const memStats = heartbeatMonitor.getTargetStats(target_id);
+      const dbStats = await OfflineStatsModel.getByTarget(target_id);
+      res.json({
+        target_id,
+        memory_stats: memStats,
+        db_stats: dbStats
+      });
+    } catch (err) {
+      console.error('[API] 获取目标离线统计失败:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   app.get('/api/status', async (req, res) => {
     const targets = gpsSimulator.getAllTargets();
     const pendingOrders = await WorkOrderModel.query({ status: 'pending', limit: 1 });
@@ -537,8 +804,27 @@ async function main() {
       start_time: new Date().setHours(0, 0, 0, 0),
       limit: 1
     });
+
+    let onlineCount = 0;
+    let offlineCount = 0;
+    let unknownCount = 0;
+    if (heartbeatMonitor) {
+      for (const t of targets) {
+        const s = heartbeatMonitor.getTargetStatus(t.id);
+        if (s === STATUS_ONLINE) onlineCount++;
+        else if (s === STATUS_OFFLINE) offlineCount++;
+        else unknownCount++;
+      }
+    }
+
     res.json({
       online_targets: targets.length,
+      target_status_breakdown: {
+        online: onlineCount,
+        offline: offlineCount,
+        unknown: unknownCount
+      },
+      silenced_targets: gpsSimulator.getSilentTargets().length,
       total_alerts: await AlertModel.getTodayCount(),
       total_work_orders: await WorkOrderModel.count(),
       pending_work_orders: pendingOrders.length,
@@ -550,6 +836,8 @@ async function main() {
       replay_active: replayManager.isReplaying(),
       escalation_scanner_running: workOrderEngine ? workOrderEngine.escalationTimer !== null : false,
       patrol_scheduler_running: patrolEngine ? patrolEngine.isRunning : false,
+      heartbeat_scanner_running: heartbeatMonitor ? heartbeatMonitor.isRunning : false,
+      heartbeat_default_timeout_seconds: heartbeatMonitor ? Math.round(heartbeatMonitor.defaultTimeoutMs / 1000) : null,
       behavior_profile_count: behaviorProfiles.length,
       today_behavior_anomalies: todayAnomalies.length,
       behavior_hourly_update_running: behaviorEngine ? behaviorEngine.hourlyTimer !== null : false
@@ -1305,6 +1593,9 @@ async function main() {
     gpsSimulator.start();
     console.log('[GPS] 模拟器已启动，5个目标正在移动');
 
+    heartbeatMonitor.startScan(5000);
+    console.log('[Heartbeat] 心跳监控已启动：全局30秒，T003单独10秒，扫描间隔5秒');
+
     heatmapManager.start();
     console.log('[Heatmap] 热力聚合器已启动');
 
@@ -1320,6 +1611,7 @@ async function main() {
     gpsSimulator.stop();
     heatmapManager.stop();
     replayManager.stopReplay();
+    if (heartbeatMonitor) heartbeatMonitor.stopScan();
     if (workOrderEngine) workOrderEngine.stopEscalationScanner();
     if (patrolEngine) patrolEngine.stopScheduler();
     if (behaviorEngine) behaviorEngine.stopHourlyUpdate();

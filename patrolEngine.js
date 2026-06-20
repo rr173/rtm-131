@@ -49,6 +49,8 @@ class PatrolEngine {
     this.targetInsideFences = new Map();
     this.schedulerTimer = null;
     this.isRunning = false;
+    this.taskPauseInfo = new Map();
+    this.targetStatusProvider = null;
   }
 
   async createTask({ task_name, target_id, target_name, frequency, planned_start_time, deadline_time, fence_ids }) {
@@ -109,6 +111,7 @@ class PatrolEngine {
 
     await PatrolTaskModel.update(taskId, { status: 'cancelled' });
     this.activeTasks.delete(taskId);
+    this.taskPauseInfo.delete(taskId);
 
     const updatedTask = await PatrolTaskModel.getById(taskId);
     if (this.onUpdate) {
@@ -137,6 +140,10 @@ class PatrolEngine {
 
     const activatedTask = await PatrolTaskModel.getById(taskId);
     this.activeTasks.set(taskId, activatedTask);
+    this.taskPauseInfo.set(taskId, {
+      accumulated_pause_ms: 0,
+      current_pause_start: null
+    });
 
     if (this.onUpdate) {
       this.onUpdate({ type: 'task_activated', task: activatedTask });
@@ -159,6 +166,7 @@ class PatrolEngine {
     });
 
     this.activeTasks.delete(taskId);
+    this.taskPauseInfo.delete(taskId);
 
     const completedTask = await PatrolTaskModel.getById(taskId);
     
@@ -181,6 +189,7 @@ class PatrolEngine {
 
     await PatrolTaskModel.update(taskId, { status: 'overdue' });
     this.activeTasks.delete(taskId);
+    this.taskPauseInfo.delete(taskId);
 
     const overdueTask = await PatrolTaskModel.getById(taskId);
     
@@ -351,8 +360,10 @@ class PatrolEngine {
     const arrivedCount = currentIndex;
     const progressPercent = totalWaypoints > 0 ? (arrivedCount / totalWaypoints) * 100 : 0;
     
-    const elapsedMs = task.actual_start_time ? now - task.actual_start_time : 0;
-    const remainingMs = task.deadline_time - now;
+    const pauseInfo = this._getTaskPauseInfo(task.id);
+    const effectiveElapsedMs = this._getEffectiveElapsedMs(task, now);
+    const effectiveRemainingMs = this._getEffectiveDeadlineDelta(task, now);
+    const isTargetOffline = pauseInfo.current_pause_start !== null;
     
     const currentWaypoint = currentIndex < totalWaypoints ? task.waypoints[currentIndex] : null;
     const nextWaypoint = currentIndex + 1 < totalWaypoints ? task.waypoints[currentIndex + 1] : null;
@@ -369,12 +380,18 @@ class PatrolEngine {
       arrived_count: arrivedCount,
       total_waypoints: totalWaypoints,
       progress_percent: Math.round(progressPercent * 10) / 10,
-      elapsed_seconds: Math.round(elapsedMs / 1000),
-      remaining_seconds: Math.max(0, Math.round(remainingMs / 1000)),
+      elapsed_seconds: Math.round(effectiveElapsedMs / 1000),
+      remaining_seconds: Math.max(0, Math.round(effectiveRemainingMs / 1000)),
       planned_start_time: task.planned_start_time,
       deadline_time: task.deadline_time,
       actual_start_time: task.actual_start_time,
-      waypoints: task.waypoints
+      waypoints: task.waypoints,
+      is_paused: isTargetOffline,
+      pause_reason: isTargetOffline ? 'target_offline' : null,
+      accumulated_pause_ms: pauseInfo.accumulated_pause_ms,
+      accumulated_pause_seconds: Math.round(pauseInfo.accumulated_pause_ms / 1000),
+      current_pause_started_at: pauseInfo.current_pause_start,
+      current_pause_seconds: pauseInfo.current_pause_start !== null ? Math.round((now - pauseInfo.current_pause_start) / 1000) : 0
     };
   }
 
@@ -423,7 +440,9 @@ class PatrolEngine {
     try {
       const overdueTasks = await PatrolTaskModel.getOverdueTasks(now);
       for (const task of overdueTasks) {
-        if (this.activeTasks.has(task.id)) {
+        if (!this.activeTasks.has(task.id)) continue;
+        const effectiveDelta = this._getEffectiveDeadlineDelta(task, now);
+        if (effectiveDelta <= 0) {
           await this.markOverdue(task.id);
         }
       }
@@ -440,9 +459,97 @@ class PatrolEngine {
     console.log(`[Patrol] 已加载 ${activeTasks.length} 个进行中的任务`);
   }
 
+  setTargetStatusProvider(provider) {
+    this.targetStatusProvider = provider;
+  }
+
+  handleTargetStatusChange(targetId, oldStatus, newStatus) {
+    for (const [taskId, task] of this.activeTasks) {
+      if (task.target_id !== targetId) continue;
+      const pauseInfo = this.taskPauseInfo.get(taskId) || {
+        accumulated_pause_ms: 0,
+        current_pause_start: null
+      };
+      if (newStatus === 'offline' && pauseInfo.current_pause_start === null) {
+        pauseInfo.current_pause_start = Date.now();
+        this.taskPauseInfo.set(taskId, pauseInfo);
+        console.log(`[Patrol] 任务 ${taskId}: 目标 ${targetId} 离线，暂停计时`);
+        if (this.onUpdate) {
+          this.onUpdate({
+            type: 'task_paused',
+            task_id: taskId,
+            target_id: targetId,
+            reason: 'target_offline',
+            paused_at: pauseInfo.current_pause_start
+          });
+        }
+      } else if ((newStatus === 'online') && pauseInfo.current_pause_start !== null) {
+        const pauseDur = Date.now() - pauseInfo.current_pause_start;
+        pauseInfo.accumulated_pause_ms += pauseDur;
+        pauseInfo.current_pause_start = null;
+        this.taskPauseInfo.set(taskId, pauseInfo);
+        console.log(`[Patrol] 任务 ${taskId}: 目标 ${targetId} 恢复在线，本次暂停 ${Math.round(pauseDur / 1000)}秒`);
+        if (this.onUpdate) {
+          this.onUpdate({
+            type: 'task_resumed',
+            task_id: taskId,
+            target_id: targetId,
+            resumed_at: Date.now(),
+            last_pause_duration_ms: pauseDur,
+            accumulated_pause_ms: pauseInfo.accumulated_pause_ms
+          });
+        }
+      }
+    }
+  }
+
+  _getTaskPauseInfo(taskId) {
+    return this.taskPauseInfo.get(taskId) || {
+      accumulated_pause_ms: 0,
+      current_pause_start: null
+    };
+  }
+
+  _isTargetOfflineForTask(task) {
+    if (!this.targetStatusProvider) return false;
+    try {
+      const status = this.targetStatusProvider(task.target_id);
+      return status === 'offline';
+    } catch (e) {
+      return false;
+    }
+  }
+
+  _getEffectiveElapsedMs(task, now = Date.now()) {
+    if (!task.actual_start_time) return 0;
+    const pauseInfo = this._getTaskPauseInfo(task.id);
+    let totalPause = pauseInfo.accumulated_pause_ms;
+    if (pauseInfo.current_pause_start !== null) {
+      totalPause += now - pauseInfo.current_pause_start;
+    }
+    return Math.max(0, (now - task.actual_start_time) - totalPause);
+  }
+
+  _getEffectiveDeadlineDelta(task, now = Date.now()) {
+    const pauseInfo = this._getTaskPauseInfo(task.id);
+    let totalPause = pauseInfo.accumulated_pause_ms;
+    if (pauseInfo.current_pause_start !== null) {
+      totalPause += now - pauseInfo.current_pause_start;
+    }
+    return (task.deadline_time + totalPause) - now;
+  }
+
   async init() {
     await this.reloadFenceCache();
     await this.loadActiveTasks();
+    for (const taskId of this.activeTasks.keys()) {
+      if (!this.taskPauseInfo.has(taskId)) {
+        this.taskPauseInfo.set(taskId, {
+          accumulated_pause_ms: 0,
+          current_pause_start: null
+        });
+      }
+    }
   }
 }
 

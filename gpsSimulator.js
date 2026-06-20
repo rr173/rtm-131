@@ -93,6 +93,7 @@ class GPSSimulator {
     this.targetStates = new Map();
     this.isRunning = false;
     this.intervalId = null;
+    this.silentTargets = new Set();
     this.initTargets();
   }
 
@@ -139,6 +140,9 @@ class GPSSimulator {
       state.trajectory.push({ ...posUpdate });
       if (state.trajectory.length > 30) {
         state.trajectory.shift();
+      }
+      if (this.silentTargets.has(targetId)) {
+        return;
       }
       if (this.onPositionUpdate) {
         this.onPositionUpdate(posUpdate);
@@ -358,6 +362,46 @@ class GPSSimulator {
 
     console.log(`[GPS] 已生成 ${durationSeconds} 秒历史轨迹数据，共 ${allPoints.length} 个点`);
     return allPoints.length;
+  }
+
+  silenceTarget(targetId) {
+    const state = this.targetStates.get(targetId);
+    if (!state) {
+      throw new Error(`目标 ${targetId} 不存在`);
+    }
+    this.silentTargets.add(targetId);
+    console.log(`[GPS] 目标 ${targetId} (${state.name}) 已静默，暂停位置上报`);
+    return {
+      target_id: targetId,
+      target_name: state.name,
+      silenced: true,
+      timestamp: Date.now()
+    };
+  }
+
+  resumeTarget(targetId) {
+    const state = this.targetStates.get(targetId);
+    if (!state) {
+      throw new Error(`目标 ${targetId} 不存在`);
+    }
+    const wasSilent = this.silentTargets.has(targetId);
+    this.silentTargets.delete(targetId);
+    console.log(`[GPS] 目标 ${targetId} (${state.name}) 已恢复位置上报`);
+    return {
+      target_id: targetId,
+      target_name: state.name,
+      silenced: false,
+      was_silent: wasSilent,
+      timestamp: Date.now()
+    };
+  }
+
+  isTargetSilent(targetId) {
+    return this.silentTargets.has(targetId);
+  }
+
+  getSilentTargets() {
+    return Array.from(this.silentTargets);
   }
 
   getTargetState(targetId) {

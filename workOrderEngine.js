@@ -7,11 +7,31 @@ class WorkOrderEngine {
   constructor(onWorkOrderUpdate) {
     this.onWorkOrderUpdate = onWorkOrderUpdate;
     this.escalationTimer = null;
+    this.targetStatusProvider = null;
+  }
+
+  setTargetStatusProvider(provider) {
+    this.targetStatusProvider = provider;
+  }
+
+  _isTargetOffline(targetId) {
+    if (!this.targetStatusProvider) return false;
+    try {
+      const status = this.targetStatusProvider(targetId);
+      return status === 'offline';
+    } catch (e) {
+      return false;
+    }
   }
 
   async createWorkOrderFromAlert(alert) {
     if (!alert || !alert.level) return null;
     if (alert.level !== 'critical' && alert.level !== 'warning') return null;
+
+    if (this._isTargetOffline(alert.target_id)) {
+      console.log(`[WorkOrder] 目标 ${alert.target_id} 离线，跳过创建工单（告警#${alert.id}）`);
+      return null;
+    }
 
     const existing = await WorkOrderModel.getByAlertId(alert.id);
     if (existing) return existing;

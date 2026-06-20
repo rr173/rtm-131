@@ -306,6 +306,40 @@ db.serialize(() => {
   db.run(`CREATE INDEX IF NOT EXISTS idx_anomaly_type ON behavior_anomaly_events(anomaly_type)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_anomaly_timestamp ON behavior_anomaly_events(timestamp)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_anomaly_target_type ON behavior_anomaly_events(target_id, anomaly_type)`);
+
+  db.run(`
+    CREATE TABLE IF NOT EXISTS offline_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      target_id TEXT NOT NULL,
+      target_name TEXT,
+      event_type TEXT NOT NULL CHECK(event_type IN ('offline', 'recover')),
+      offline_start_at INTEGER NOT NULL,
+      offline_end_at INTEGER,
+      offline_duration_ms INTEGER,
+      last_lng REAL,
+      last_lat REAL,
+      recover_lng REAL,
+      recover_lat REAL,
+      created_at INTEGER NOT NULL
+    )
+  `);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_offline_events_target ON offline_events(target_id)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_offline_events_type ON offline_events(event_type)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_offline_events_start ON offline_events(offline_start_at)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_offline_events_target_time ON offline_events(target_id, offline_start_at)`);
+
+  db.run(`
+    CREATE TABLE IF NOT EXISTS target_offline_stats (
+      target_id TEXT PRIMARY KEY,
+      total_offline_count INTEGER NOT NULL DEFAULT 0,
+      total_offline_ms INTEGER NOT NULL DEFAULT 0,
+      longest_single_offline_ms INTEGER NOT NULL DEFAULT 0,
+      latest_offline_start_at INTEGER,
+      latest_offline_end_at INTEGER,
+      latest_offline_duration_ms INTEGER,
+      updated_at INTEGER NOT NULL
+    )
+  `);
 });
 
 function run(sql, params = []) {
@@ -1421,6 +1455,90 @@ const BehaviorAnomalyModel = {
   }
 };
 
+const OfflineEventModel = {
+  async create({ target_id, target_name, event_type, offline_start_at, offline_end_at, offline_duration_ms, last_lng, last_lat, recover_lng, recover_lat }) {
+    const now = Date.now();
+    const result = await run(
+      `INSERT INTO offline_events 
+        (target_id, target_name, event_type, offline_start_at, offline_end_at, offline_duration_ms, last_lng, last_lat, recover_lng, recover_lat, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [target_id, target_name || null, event_type, offline_start_at,
+       offline_end_at || null, offline_duration_ms || null,
+       last_lng !== undefined ? last_lng : null,
+       last_lat !== undefined ? last_lat : null,
+       recover_lng !== undefined ? recover_lng : null,
+       recover_lat !== undefined ? recover_lat : null, now]
+    );
+    return this.getById(result.lastID);
+  },
+
+  async getById(id) {
+    return get('SELECT * FROM offline_events WHERE id = ?', [id]);
+  },
+
+  async query({ target_id, event_type, start_time, end_time, limit = 100, offset = 0 } = {}) {
+    let sql = 'SELECT * FROM offline_events WHERE 1=1';
+    const params = [];
+    if (target_id) { sql += ' AND target_id = ?'; params.push(target_id); }
+    if (event_type) { sql += ' AND event_type = ?'; params.push(event_type); }
+    if (start_time) { sql += ' AND offline_start_at >= ?'; params.push(start_time); }
+    if (end_time) { sql += ' AND offline_start_at <= ?'; params.push(end_time); }
+    sql += ' ORDER BY offline_start_at DESC LIMIT ? OFFSET ?';
+    params.push(limit, offset);
+    return all(sql, params);
+  },
+
+  async getByTarget(target_id, limit = 100) {
+    return all(
+      'SELECT * FROM offline_events WHERE target_id = ? ORDER BY offline_start_at DESC LIMIT ?',
+      [target_id, limit]
+    );
+  }
+};
+
+const OfflineStatsModel = {
+  async upsert({ target_id, total_offline_count, total_offline_ms, longest_single_offline_ms, latest_offline_start_at, latest_offline_end_at, latest_offline_duration_ms }) {
+    const now = Date.now();
+    const existing = await get('SELECT target_id FROM target_offline_stats WHERE target_id = ?', [target_id]);
+    if (existing) {
+      await run(
+        `UPDATE target_offline_stats SET 
+          total_offline_count = ?, total_offline_ms = ?, longest_single_offline_ms = ?,
+          latest_offline_start_at = ?, latest_offline_end_at = ?, latest_offline_duration_ms = ?, updated_at = ?
+         WHERE target_id = ?`,
+        [total_offline_count, total_offline_ms, longest_single_offline_ms,
+         latest_offline_start_at || null, latest_offline_end_at || null,
+         latest_offline_duration_ms || null, now, target_id]
+      );
+    } else {
+      await run(
+        `INSERT INTO target_offline_stats 
+          (target_id, total_offline_count, total_offline_ms, longest_single_offline_ms,
+           latest_offline_start_at, latest_offline_end_at, latest_offline_duration_ms, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        [target_id, total_offline_count || 0, total_offline_ms || 0,
+         longest_single_offline_ms || 0,
+         latest_offline_start_at || null, latest_offline_end_at || null,
+         latest_offline_duration_ms || null, now]
+      );
+    }
+    return this.getByTarget(target_id);
+  },
+
+  async getByTarget(target_id) {
+    return get('SELECT * FROM target_offline_stats WHERE target_id = ?', [target_id]);
+  },
+
+  async getAll() {
+    return all('SELECT * FROM target_offline_stats');
+  },
+
+  async delete(target_id) {
+    await run('DELETE FROM target_offline_stats WHERE target_id = ?', [target_id]);
+    return true;
+  }
+};
+
 module.exports = {
   db,
   FenceModel,
@@ -1439,5 +1557,7 @@ module.exports = {
   WorkOrderEscalationModel,
   PatrolTaskModel,
   BehaviorProfileModel,
-  BehaviorAnomalyModel
+  BehaviorAnomalyModel,
+  OfflineEventModel,
+  OfflineStatsModel
 };
