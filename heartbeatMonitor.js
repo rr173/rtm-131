@@ -52,11 +52,11 @@ class HeartbeatMonitor {
       timestamp: now
     });
 
-    if (prevStatus === STATUS_OFFLINE || prevStatus === STATUS_UNKNOWN) {
+    if (prevStatus === STATUS_OFFLINE) {
       const offlineSession = this.currentOfflineSession.get(targetId);
       const offlineDurationMs = offlineSession ? (now - offlineSession.offlineAt) : 0;
 
-      if (prevStatus === STATUS_OFFLINE && offlineSession) {
+      if (offlineSession) {
         this.currentOfflineSession.delete(targetId);
         this._updateStatsOnRecover(targetId, offlineSession.offlineAt, now);
         OfflineEventModel.create({
@@ -111,6 +111,21 @@ class HeartbeatMonitor {
         }
       }
       console.log(`[Heartbeat] 目标 ${targetId} (${position.name}) 已恢复在线，离线 ${this._formatDuration(offlineDurationMs)}`);
+    } else if (prevStatus === STATUS_UNKNOWN) {
+      if (this.onStatusChange) {
+        try {
+          this.onStatusChange({
+            target_id: targetId,
+            target_name: position.name,
+            old_status: prevStatus,
+            new_status: STATUS_ONLINE,
+            timestamp: now
+          });
+        } catch (err) {
+          console.error('[Heartbeat] 推送状态变更失败:', err.message);
+        }
+      }
+      console.log(`[Heartbeat] 目标 ${targetId} (${position.name}) 首次上线`);
     }
   }
 

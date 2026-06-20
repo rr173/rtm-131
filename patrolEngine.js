@@ -140,13 +140,29 @@ class PatrolEngine {
 
     const activatedTask = await PatrolTaskModel.getById(taskId);
     this.activeTasks.set(taskId, activatedTask);
+
+    let initialPauseStart = null;
+    if (this._isTargetOfflineForTask(activatedTask)) {
+      initialPauseStart = now;
+      console.log(`[Patrol] 任务 ${taskId}: 激活时目标 ${activatedTask.target_id} 已离线，立即暂停计时`);
+    }
+
     this.taskPauseInfo.set(taskId, {
       accumulated_pause_ms: 0,
-      current_pause_start: null
+      current_pause_start: initialPauseStart
     });
 
     if (this.onUpdate) {
       this.onUpdate({ type: 'task_activated', task: activatedTask });
+      if (initialPauseStart !== null) {
+        this.onUpdate({
+          type: 'task_paused',
+          task_id: taskId,
+          target_id: activatedTask.target_id,
+          reason: 'target_already_offline',
+          paused_at: initialPauseStart
+        });
+      }
     }
 
     console.log(`[Patrol] 任务已激活: ${taskId}, 目标: ${task.target_id}`);
