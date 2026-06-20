@@ -6,6 +6,7 @@ class CapacityManager {
     this.configs = new Map();
     this.states = new Map();
     this.inflowHistory = new Map();
+    this.overlimitTargets = new Map();
   }
 
   async loadConfigs() {
@@ -49,6 +50,7 @@ class CapacityManager {
     this.configs.delete(fenceId);
     this.states.delete(fenceId);
     this.inflowHistory.delete(fenceId);
+    this.overlimitTargets.delete(fenceId);
   }
 
   hasCapacity(fenceId) {
@@ -102,7 +104,7 @@ class CapacityManager {
   }
 
   computeStatus(currentCount, config) {
-    const warningThreshold = Math.ceil(config.max_capacity * config.warning_threshold_pct / 100);
+    const warningThreshold = Math.max(1, Math.min(Math.floor(config.max_capacity * config.warning_threshold_pct / 100), config.max_capacity - 1));
     if (currentCount >= config.max_capacity) return 'full';
     if (currentCount >= warningThreshold) return 'warning';
     return 'normal';
@@ -120,28 +122,35 @@ class CapacityManager {
 
     this.recordInflow(fenceId, true, timestamp);
 
-    const newCount = currentCount;
-    const newStatus = this.computeStatus(newCount, config);
-    const oldStatus = state.status;
+    if (!this.overlimitTargets.has(fenceId)) {
+      this.overlimitTargets.set(fenceId, new Set());
+    }
 
-    state.current_count = newCount;
+    const isOverlimit = state.status === 'full';
 
-    if (oldStatus === 'full' && newCount > config.max_capacity) {
+    if (isOverlimit) {
+      this.overlimitTargets.get(fenceId).add(targetId);
+
       await CapacityEventModel.create({
         fence_id: fenceId,
         fence_name: fenceName,
         event_type: 'capacity_overlimit',
-        old_status: oldStatus,
+        old_status: 'full',
         new_status: 'full',
-        current_count: newCount,
+        current_count: state.current_count,
         max_capacity: config.max_capacity,
         target_id: targetId,
         target_name: targetName,
         timestamp,
         details: { rejected: true }
       });
-      return { overlimit: true, oldStatus, newStatus: 'full' };
+      return { overlimit: true, oldStatus: 'full', newStatus: 'full' };
     }
+
+    state.current_count = state.current_count + 1;
+    const newCount = state.current_count;
+    const newStatus = this.computeStatus(newCount, config);
+    const oldStatus = state.status;
 
     if (newStatus !== oldStatus) {
       state.status = newStatus;
@@ -194,17 +203,21 @@ class CapacityManager {
     const state = this.states.get(fenceId);
 
     if (!isFenceActive) {
-      state.current_count = currentCount;
       return;
     }
 
     this.recordInflow(fenceId, false, timestamp);
 
-    const newCount = currentCount;
+    const overlimitSet = this.overlimitTargets.get(fenceId);
+    if (overlimitSet && overlimitSet.has(targetId)) {
+      overlimitSet.delete(targetId);
+      return;
+    }
+
+    state.current_count = Math.max(0, state.current_count - 1);
+    const newCount = state.current_count;
     const newStatus = this.computeStatus(newCount, config);
     const oldStatus = state.status;
-
-    state.current_count = newCount;
 
     if (newStatus !== oldStatus) {
       state.status = newStatus;
@@ -255,6 +268,12 @@ class CapacityManager {
     const fenceName = fence ? fence.name : `Fence ${fenceId}`;
 
     state.status = 'normal';
+    state.current_count = 0;
+
+    const overlimitSet = this.overlimitTargets.get(fenceId);
+    if (overlimitSet) {
+      overlimitSet.clear();
+    }
 
     await CapacityEventModel.create({
       fence_id: fenceId,
@@ -287,8 +306,14 @@ class CapacityManager {
     const config = this.configs.get(fenceId);
     if (!state || !config) return;
 
-    state.current_count = currentCount;
-    const newStatus = this.computeStatus(currentCount, config);
+    const overlimitSet = this.overlimitTargets.get(fenceId);
+    if (overlimitSet) {
+      overlimitSet.clear();
+    }
+
+    const effectiveCount = Math.min(currentCount, config.max_capacity);
+    state.current_count = effectiveCount;
+    const newStatus = this.computeStatus(effectiveCount, config);
     const oldStatus = state.status;
 
     if (newStatus === oldStatus) return;
@@ -312,7 +337,7 @@ class CapacityManager {
       event_type: eventType,
       old_status: oldStatus,
       new_status: newStatus,
-      current_count: currentCount,
+      current_count: effectiveCount,
       max_capacity: config.max_capacity,
       timestamp: Date.now(),
       details: { reason: 'fence_reactivated' }
@@ -324,9 +349,9 @@ class CapacityManager {
         fence_name: fenceName,
         old_status: oldStatus,
         new_status: newStatus,
-        current_count: currentCount,
+        current_count: effectiveCount,
         max_capacity: config.max_capacity,
-        ratio: config.max_capacity > 0 ? Math.round(currentCount / config.max_capacity * 1000) / 10 : 0,
+        ratio: config.max_capacity > 0 ? Math.round(effectiveCount / config.max_capacity * 1000) / 10 : 0,
         timestamp: Date.now()
       });
     }
@@ -349,7 +374,7 @@ class CapacityManager {
       ratio: config.max_capacity > 0 ? Math.round(state.current_count / config.max_capacity * 1000) / 10 : 0,
       status: state.status,
       warning_threshold_pct: config.warning_threshold_pct,
-      warning_threshold_count: Math.ceil(config.max_capacity * config.warning_threshold_pct / 100),
+      warning_threshold_count: Math.max(1, Math.min(Math.floor(config.max_capacity * config.warning_threshold_pct / 100), config.max_capacity - 1)),
       predicted_minutes_to_full: prediction,
       today_full_count: todayFullCount
     };

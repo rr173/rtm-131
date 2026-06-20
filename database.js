@@ -1865,14 +1865,17 @@ const CapacityEventModel = {
   },
   async getDailyFullDuration(fenceId, dayStart, dayEnd) {
     const rows = await all(
-      `SELECT
-         SUM(CASE
-           WHEN event_type = 'capacity_normal' AND old_status = 'full' THEN (timestamp - LAG(timestamp) OVER (PARTITION BY fence_id ORDER BY timestamp))
-           ELSE 0
-         END) as full_duration_ms
-       FROM capacity_events
-       WHERE fence_id = ? AND timestamp >= ? AND timestamp <= ?
-       ORDER BY timestamp`,
+      `WITH full_entries AS (
+         SELECT
+           timestamp as full_start,
+           LEAD(timestamp) OVER (ORDER BY timestamp) as full_end
+         FROM capacity_events
+         WHERE fence_id = ? AND timestamp >= ? AND timestamp <= ?
+           AND event_type = 'capacity_full'
+       )
+       SELECT COALESCE(SUM(full_end - full_start), 0) as full_duration_ms
+       FROM full_entries
+       WHERE full_end IS NOT NULL`,
       [fenceId, dayStart, dayEnd]
     );
     return rows && rows[0] ? (rows[0].full_duration_ms || 0) : 0;
