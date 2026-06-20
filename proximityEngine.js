@@ -21,6 +21,7 @@ class ProximityEngine {
     this.lastDistances = new Map();
     this.lastAlertTimes = new Map();
     this.activePairs = new Map();
+    this.pendingPairs = new Set();
 
     this.fenceEngine = null;
     this.targetStatusProvider = null;
@@ -91,6 +92,7 @@ class ProximityEngine {
     const groupIdA = bindingA ? bindingA.group_id : null;
 
     const results = [];
+    let statusChanged = false;
 
     for (const [otherId, otherPos] of this.targetPositions.entries()) {
       if (otherId === targetId) continue;
@@ -114,33 +116,68 @@ class ProximityEngine {
       const lastAlertAt = this.lastAlertTimes.get(pairKey);
       const inDedupWindow = lastAlertAt && (now - lastAlertAt) < DEDUPLICATION_WINDOW_MS;
 
-      if (prevDist !== undefined &&
-          currentDist < prevDist &&
-          currentDist < threshold &&
-          !inDedupWindow) {
+      const isBelowThreshold = currentDist < threshold;
+      const wasBelowThreshold = this.activePairs.has(pairKey);
+      const isConverging = prevDist !== undefined && currentDist < prevDist;
 
-        this.lastAlertTimes.set(pairKey, now);
-
-        const event = await this._createProximityEvent(
-          targetId, otherId,
-          bindingA, bindingB,
-          currentDist, prevDist, threshold,
-          position, otherPos,
-          now
-        );
-
-        this.activePairs.set(pairKey, event);
-
-        if (this.onProximityEvent) {
-          this.onProximityEvent(event);
+      if (isBelowThreshold) {
+        if (!wasBelowThreshold && !this.pendingPairs.has(pairKey)) {
+          this.pendingPairs.add(pairKey);
+          try {
+            const event = await this._createProximityEvent(
+              targetId, otherId,
+              bindingA, bindingB,
+              currentDist, prevDist, threshold,
+              position, otherPos,
+              now
+            );
+            this.activePairs.set(pairKey, event);
+            this.lastAlertTimes.set(pairKey, now);
+            results.push(event);
+            statusChanged = true;
+            if (this.onProximityEvent) {
+              this.onProximityEvent(event);
+            }
+          } finally {
+            this.pendingPairs.delete(pairKey);
+          }
+        } else if (wasBelowThreshold) {
+          const existing = this.activePairs.get(pairKey);
+          const updated = {
+            ...existing,
+            distance: currentDist,
+            lng_a: position.lng,
+            lat_a: position.lat,
+            lng_b: otherPos.lng,
+            lat_b: otherPos.lat,
+            timestamp: now
+          };
+          this.activePairs.set(pairKey, updated);
         }
-        if (this.onStatusUpdate) {
-          this.onStatusUpdate(this.getAllActivePairs());
+
+        if (isConverging && !inDedupWindow && wasBelowThreshold && !this.pendingPairs.has(pairKey)) {
+          this.pendingPairs.add(pairKey);
+          try {
+            this.lastAlertTimes.set(pairKey, now);
+            const event = await this._createProximityEvent(
+              targetId, otherId,
+              bindingA, bindingB,
+              currentDist, prevDist, threshold,
+              position, otherPos,
+              now
+            );
+            results.push(event);
+            if (this.onProximityEvent) {
+              this.onProximityEvent(event);
+            }
+          } finally {
+            this.pendingPairs.delete(pairKey);
+          }
         }
-        results.push(event);
-      } else if (this.activePairs.has(pairKey) && currentDist >= threshold) {
+      } else if (wasBelowThreshold) {
         const existing = this.activePairs.get(pairKey);
         this.activePairs.delete(pairKey);
+        statusChanged = true;
         if (this.onLeaveEvent) {
           this.onLeaveEvent({
             target_id_a: existing.target_id_a,
@@ -154,10 +191,11 @@ class ProximityEngine {
             leave_from_fence_name: existing.fence_name
           });
         }
-        if (this.onStatusUpdate) {
-          this.onStatusUpdate(this.getAllActivePairs());
-        }
       }
+    }
+
+    if (statusChanged && this.onStatusUpdate) {
+      this.onStatusUpdate(this.getAllActivePairs());
     }
 
     return results;
@@ -170,6 +208,22 @@ class ProximityEngine {
     posA, posB,
     timestamp
   ) {
+    let finalTargetIdA = targetIdA;
+    let finalTargetIdB = targetIdB;
+    let finalBindingA = bindingA;
+    let finalBindingB = bindingB;
+    let finalPosA = posA;
+    let finalPosB = posB;
+
+    if (targetIdA > targetIdB) {
+      finalTargetIdA = targetIdB;
+      finalTargetIdB = targetIdA;
+      finalBindingA = bindingB;
+      finalBindingB = bindingA;
+      finalPosA = posB;
+      finalPosB = posA;
+    }
+
     let fenceId = null;
     let fenceName = null;
     let fenceType = null;
@@ -177,7 +231,7 @@ class ProximityEngine {
     let level = 'info';
 
     if (this.fenceEngine) {
-      const commonFences = this._findCommonFences(posA, posB);
+      const commonFences = this._findCommonFences(finalPosA, finalPosB);
       if (commonFences.length > 0) {
         const f = commonFences[0];
         fenceId = f.id;
@@ -185,21 +239,21 @@ class ProximityEngine {
         fenceType = f.type;
       }
 
-      if (bindingA && bindingB && bindingA.group_id !== bindingB.group_id && fenceId !== null) {
+      if (finalBindingA && finalBindingB && finalBindingA.group_id !== finalBindingB.group_id && fenceId !== null) {
         isConfrontation = true;
         level = fenceType === 'forbidden_enter' ? 'critical' : 'warning';
       }
     }
 
     const data = {
-      target_id_a: targetIdA,
-      target_name_a: posA.name,
-      target_id_b: targetIdB,
-      target_name_b: posB.name,
-      group_id_a: bindingA ? bindingA.group_id : null,
-      group_name_a: bindingA ? bindingA.group_name : null,
-      group_id_b: bindingB ? bindingB.group_id : null,
-      group_name_b: bindingB ? bindingB.group_name : null,
+      target_id_a: finalTargetIdA,
+      target_name_a: finalPosA.name,
+      target_id_b: finalTargetIdB,
+      target_name_b: finalPosB.name,
+      group_id_a: finalBindingA ? finalBindingA.group_id : null,
+      group_name_a: finalBindingA ? finalBindingA.group_name : null,
+      group_id_b: finalBindingB ? finalBindingB.group_id : null,
+      group_name_b: finalBindingB ? finalBindingB.group_name : null,
       distance: currentDist,
       prev_distance: prevDist,
       threshold: threshold,
@@ -208,10 +262,10 @@ class ProximityEngine {
       fence_name: fenceName,
       fence_type: fenceType,
       level: level,
-      lng_a: posA.lng,
-      lat_a: posA.lat,
-      lng_b: posB.lng,
-      lat_b: posB.lat,
+      lng_a: finalPosA.lng,
+      lat_a: finalPosA.lat,
+      lng_b: finalPosB.lng,
+      lat_b: finalPosB.lat,
       timestamp: timestamp
     };
 
@@ -222,7 +276,9 @@ class ProximityEngine {
   _findCommonFences(posA, posB) {
     if (!this.fenceEngine || !this.fenceEngine.fences) return [];
     const common = [];
+    const now = new Date();
     for (const fence of this.fenceEngine.fences) {
+      if (!this.fenceEngine.isFenceActive(fence.id, now)) continue;
       const inA = this._isTargetInFence(posA, fence);
       const inB = this._isTargetInFence(posB, fence);
       if (inA && inB) {

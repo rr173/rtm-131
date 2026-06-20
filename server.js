@@ -2072,9 +2072,11 @@ async function main() {
 
   app.get('/api/proximity/events', async (req, res) => {
     try {
-      const { target_id, group_id, fence_id, is_confrontation, level, start_time, end_time, limit, offset } = req.query;
+      const { target_id, target_id_a, target_id_b, group_id, fence_id, is_confrontation, level, start_time, end_time, limit, offset } = req.query;
       const events = await ProximityEventModel.query({
         target_id,
+        target_id_a,
+        target_id_b,
         group_id: group_id !== undefined && group_id !== '' ? parseInt(group_id) : undefined,
         fence_id: fence_id !== undefined && fence_id !== '' ? parseInt(fence_id) : undefined,
         is_confrontation: is_confrontation !== undefined && is_confrontation !== '' ? (is_confrontation === 'true' || is_confrontation === '1') : undefined,

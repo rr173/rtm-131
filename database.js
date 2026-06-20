@@ -2076,10 +2076,13 @@ const ProximityEventModel = {
     return this._parseRow(row);
   },
 
-  async query({ target_id, group_id, fence_id, is_confrontation, level, start_time, end_time, limit = 100, offset = 0 } = {}) {
+  async query({ target_id, target_id_a, target_id_b, group_id, fence_id, is_confrontation, level, start_time, end_time, limit = 100, offset = 0 } = {}) {
     let sql = 'SELECT * FROM proximity_events WHERE 1=1';
     const params = [];
-    if (target_id) {
+    if (target_id_a && target_id_b) {
+      sql += ' AND ((target_id_a = ? AND target_id_b = ?) OR (target_id_a = ? AND target_id_b = ?))';
+      params.push(target_id_a, target_id_b, target_id_b, target_id_a);
+    } else if (target_id) {
       sql += ' AND (target_id_a = ? OR target_id_b = ?)';
       params.push(target_id, target_id);
     }
